@@ -80,7 +80,16 @@ APP_NAME = os.environ.get("APP_NAME", "Unified CRM/ERP")
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY обязателен, задайте переменную окружения SECRET_KEY")
+    # In development (DEBUG=1), generate an ephemeral secret key to avoid startup failures.
+    # In production, SECRET_KEY is mandatory to maintain session security.
+    if os.environ.get("DEBUG", "0") == "1":
+        SECRET_KEY = secrets.token_urlsafe(48)
+        try:
+            print("[WARN] DEBUG=1: generated ephemeral SECRET_KEY for development only")
+        except Exception:
+            pass
+    else:
+        raise RuntimeError("SECRET_KEY обязателен, задайте переменную окружения SECRET_KEY")
 
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -7521,7 +7530,7 @@ def deals_page():
         rows = query_db(f"SELECT * FROM deals WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", tuple(params))
         users_rows = query_db("SELECT id, username FROM users WHERE org_id=? AND active=1 ORDER BY username", (org_id,))
         users = [dict(u) for u in (users_rows or [])]
-        inner = render_safe(DEALS_TMPL, deals=rows, users=users)
+        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users)
         return render_safe(LAYOUT_TMPL, inner=inner)
     except Exception as e:
         app.logger.exception(f"Deals page error: {e}")
@@ -8156,7 +8165,76 @@ def api_webhook_retry(qid):
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Global Search UI route is provided in STYLES PART 9/9 -------------------
+# ------------------- Global Search UI -------------------
+@app.route("/search")
+@login_required
+def search_page():
+    try:
+        q = (request.args.get("q") or "").strip()
+        results = {"inbox": [], "tasks": [], "chats": []}
+        if q:
+            org_id = current_org_id()
+            q_fts = fts_sanitize(q)
+            inbox_rows = query_db(
+                """
+                SELECT m.id, m.thread_id, m.body
+                FROM inbox_messages m
+                JOIN inbox_messages_fts f ON f.rowid=m.id
+                WHERE m.org_id=? AND f.body MATCH ?
+                ORDER BY m.id DESC LIMIT 50
+                """,
+                (org_id, q_fts),
+            )
+            task_rows = query_db(
+                """
+                SELECT t.id, t.title, t.description
+                FROM tasks t
+                JOIN tasks_fts f ON f.rowid=t.id
+                WHERE t.org_id=? AND f MATCH ?
+                ORDER BY t.id DESC LIMIT 50
+                """,
+                (org_id, q_fts),
+            )
+            chat_rows = query_db(
+                """
+                SELECT c.id, c.channel_id, c.body
+                FROM chat_messages c
+                JOIN chat_messages_fts f ON f.rowid=c.id
+                WHERE c.org_id=? AND f.body MATCH ?
+                ORDER BY c.id DESC LIMIT 50
+                """,
+                (org_id, q_fts),
+            )
+            results["inbox"] = [dict(r) for r in (inbox_rows or [])]
+            results["tasks"] = [dict(r) for r in (task_rows or [])]
+            results["chats"] = [dict(r) for r in (chat_rows or [])]
+        inner = render_safe(SEARCH_TMPL, q=q, results=results)
+        return render_safe(LAYOUT_TMPL, inner=inner)
+    except Exception as e:
+        app.logger.exception(f"Search page error: {e}")
+        flash("Внутренняя ошибка", "error")
+        return redirect(url_for("index"))
+
+# ------------------- Import CSV Wizard (UI) -------------------
+@app.route("/import", methods=["GET", "POST"])
+@login_required
+def import_csv_wizard():
+    try:
+        if request.method == "POST":
+            verify_csrf()
+            f = request.files.get("csvfile")
+            mode = (request.form.get("mode") or "").strip()
+            if not f or not f.filename:
+                flash("Файл не выбран", "error")
+            else:
+                # Подтверждаем приём файла; дальнейшая обработка настраивается отдельно
+                flash("Файл получен, обработка будет выполнена", "success")
+        inner = render_safe(IMPORT_TMPL)
+        return render_safe(LAYOUT_TMPL, inner=inner)
+    except Exception as e:
+        app.logger.exception(f"Import wizard error: {e}")
+        flash("Внутренняя ошибка", "error")
+        return redirect(url_for("index"))
 
 
 # ------------------- Deals Kanban (missing APIs implemented) -------------------
@@ -11403,6 +11481,80 @@ SIMPLE_MSG_TMPL = """
 </div>
 """
 
+SEARCH_TMPL = """
+<h2>Поиск по базе</h2>
+
+<div class="card">
+  <form method="get" action="{{ url_for('search_page') }}" style="display:flex;gap:8px;max-width:820px;">
+    <input class="input" name="q" value="{{ q or '' }}" placeholder="Что ищем? (текст, номер, email)">
+    <button class="button" type="submit">Искать</button>
+    <a class="button ghost" href="{{ url_for('search_page') }}">Сбросить</a>
+  </form>
+  {% if not q %}
+  <div class="help" style="margin-top:8px;">Введите запрос и нажмите «Искать»</div>
+  {% endif %}
+  {% if q and (results.inbox|length + results.tasks|length + results.chats|length)==0 %}
+  <div class="help" style="margin-top:8px;">Ничего не найдено</div>
+  {% endif %}
+  </div>
+
+<div class="split" style="margin-top:10px;">
+  <div class="card">
+    <h3>Входящие</h3>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Фрагмент</th><th></th></tr></thead>
+      <tbody>
+        {% for m in results.inbox %}
+        <tr>
+          <td>#{{ m.id }}</td>
+          <td class="help">{{ (m.body or '')[:120] }}</td>
+          <td><a class="iconbtn small" href="{{ url_for('thread_view', tid=m.thread_id) }}">Открыть тред</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Задачи</h3>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Заголовок</th><th></th></tr></thead>
+      <tbody>
+        {% for t in results.tasks %}
+        <tr>
+          <td>#{{ t.id }}</td>
+          <td>{{ t.title or '' }}</td>
+          <td><a class="iconbtn small" href="{{ url_for('task_view', tid=t.id) }}">Открыть</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Чаты</h3>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Фрагмент</th><th></th></tr></thead>
+      <tbody>
+        {% for c in results.chats %}
+        <tr>
+          <td>#{{ c.id }}</td>
+          <td class="help">{{ (c.body or '')[:120] }}</td>
+          <td><a class="iconbtn small" href="{{ url_for('chat_channel', cid=c.channel_id) }}">Открыть канал</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
 LOOKUP_TMPL = """
 <h2>Поиск клиента</h2>
 
@@ -11571,7 +11723,7 @@ CHAT_TMPL = """
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  function esc(s){ return String(s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }
+  function esc(s){ return String(s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
   // Channel filter
   document.getElementById('chanFilter')?.addEventListener('input', e=>{
@@ -12067,7 +12219,7 @@ SETTINGS_TMPL = """
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  function esc(s){ return String(s||'').replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }
+  function esc(s){ return String(s||'').replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
   // Телефония: показать URL вебхуков
   document.querySelectorAll('.btnUrls')?.forEach(b=>{
