@@ -7127,78 +7127,6 @@ def api_task_delegate():
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Assign endpoints -------------------
-@app.route("/api/task/assign", methods=["POST"])
-@login_required
-def api_task_assign():
-    try:
-        verify_csrf_header()
-        org_id = current_org_id()
-        d = request.get_json(force=True) or {}
-        task_id = int(d.get("task_id") or 0)
-        assignee_id = int(d.get("assignee_id") or 0)
-        if not task_id or not assignee_id:
-            return jsonify(ok=False, error="bad request"), 400
-        t = query_db("SELECT * FROM tasks WHERE id=? AND org_id=?", (task_id, org_id), one=True)
-        if not t:
-            return jsonify(ok=False, error="not found"), 404
-        if not can_edit_task(session["user_id"], t):
-            return jsonify(ok=False, error="forbidden"), 403
-        if not query_db("SELECT 1 FROM users WHERE id=? AND org_id=? AND active=1", (assignee_id, org_id), one=True):
-            return jsonify(ok=False, error="assignee out of org"), 400
-        exec_db("UPDATE tasks SET assignee_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (assignee_id, task_id, org_id))
-        _ = exec_db("INSERT INTO task_participants (org_id,task_id,user_id,role) VALUES (?,?,?,?)", (org_id, task_id, assignee_id, "assignee"))
-        add_task_activity(org_id, task_id, session["user_id"], "assignee_set", {"assignee_id": assignee_id})
-        try:
-            u = query_db("SELECT username FROM users WHERE id=?", (assignee_id,), one=True)
-            uname = (u["username"] if u else str(assignee_id))
-            notify_user(assignee_id, "Вам назначена задача", f"Задача #{task_id}", url_for("task_view", tid=task_id, _external=True))
-            sse_publish_users([assignee_id], "task.assigned", {"task_id": task_id, "assignee_id": assignee_id})
-            add_audit(org_id, "task.assigned", "task", task_id, {"assignee_id": assignee_id})
-            fire_event("task.updated", org_id, {"task_id": task_id, "assignee_id": assignee_id})
-        except Exception:
-            uname = str(assignee_id)
-            pass
-        return jsonify(ok=True, assignee_id=assignee_id, assignee_name=uname)
-    except Exception as e:
-        app.logger.exception(f"Task assign error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
-
-
-@app.route("/api/task/assign_me", methods=["POST"])
-@login_required
-def api_task_assign_me():
-    try:
-        verify_csrf_header()
-        org_id = current_org_id()
-        d = request.get_json(force=True) or {}
-        task_id = int(d.get("task_id") or 0)
-        if not task_id:
-            return jsonify(ok=False, error="bad request"), 400
-        t = query_db("SELECT * FROM tasks WHERE id=? AND org_id=?", (task_id, org_id), one=True)
-        if not t:
-            return jsonify(ok=False, error="not found"), 404
-        if not can_edit_task(session["user_id"], t):
-            return jsonify(ok=False, error="forbidden"), 403
-        assignee_id = int(session["user_id"])  # current user
-        exec_db("UPDATE tasks SET assignee_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (assignee_id, task_id, org_id))
-        _ = exec_db("INSERT INTO task_participants (org_id,task_id,user_id,role) VALUES (?,?,?,?)", (org_id, task_id, assignee_id, "assignee"))
-        add_task_activity(org_id, task_id, session["user_id"], "assignee_set", {"assignee_id": assignee_id, "self": True})
-        try:
-            u = query_db("SELECT username FROM users WHERE id=?", (assignee_id,), one=True)
-            uname = (u["username"] if u else str(assignee_id))
-            notify_user(assignee_id, "Задача назначена вам", f"Задача #{task_id}", url_for("task_view", tid=task_id, _external=True))
-            sse_publish_users([assignee_id], "task.assigned", {"task_id": task_id, "assignee_id": assignee_id})
-            add_audit(org_id, "task.assigned_me", "task", task_id, {"assignee_id": assignee_id})
-            fire_event("task.updated", org_id, {"task_id": task_id, "assignee_id": assignee_id})
-        except Exception:
-            uname = str(assignee_id)
-            pass
-        return jsonify(ok=True, assignee_id=assignee_id, assignee_name=uname)
-    except Exception as e:
-        app.logger.exception(f"Task assign_me error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
-
 # ------------------- Task detail page + Comments API + Pin files -------------------
 @app.route("/task/<int:tid>")
 @login_required
@@ -7602,8 +7530,7 @@ def deals_page():
         rows = query_db(f"SELECT * FROM deals WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", tuple(params))
         users_rows = query_db("SELECT id, username FROM users WHERE org_id=? AND active=1 ORDER BY username", (org_id,))
         users = [dict(u) for u in (users_rows or [])]
-        users_map = {int(u["id"]): (u["username"] or "") for u in users}
-        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users, users_map=users_map)
+        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users)
         return render_safe(LAYOUT_TMPL, inner=inner)
     except Exception as e:
         app.logger.exception(f"Deals page error: {e}")
@@ -10131,8 +10058,6 @@ TASKS_TMPL = """
         <td style="white-space:nowrap;display:flex;gap:6px;align-items:center;">
           <button class="iconbtn small tk-toggle" data-id="{{ t.id }}" title="Готово/открыть">⏺</button>
           <a class="iconbtn small" href="{{ url_for('task_view', tid=t.id) }}">Открыть</a>
-          <button class="iconbtn small tk-assign" data-id="{{ t.id }}" title="Назначить">👤</button>
-          <button class="iconbtn small tk-assign-me" data-id="{{ t.id }}" title="Назначить мне">🙋</button>
           <button class="iconbtn small tk-dial" data-id="{{ t.id }}" title="Позвонить">📞</button>
         </td>
       </tr>
@@ -10286,16 +10211,6 @@ TASKS_TMPL = """
   </div>
   
 </div>
-<div class="modal-backdrop" id="assignModal">
-  <div class="modal">
-    <h3>Назначение задачи</h3>
-    <input class="input" id="assignSearch" placeholder="Поиск пользователя (имя/ID)...">
-    <div id="assignList" style="max-height:50vh;overflow:auto;margin-top:8px;"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
-      <button class="button secondary" id="btnAssignCancel">Отмена</button>
-    </div>
-  </div>
-</div>
 <div class="fab">
   <button class="plus" id="btnFabTask" title="новая задача">+</button>
   <script nonce="{{ csp_nonce }}">
@@ -10303,60 +10218,6 @@ TASKS_TMPL = """
     document.getElementById('btnTaskCancel')?.addEventListener('click', (e)=>{ e.preventDefault(); document.getElementById('taskModal').classList.remove('show'); });
   </script>
 </div>
-<script nonce="{{ csp_nonce }}">
-  // Assignment modal logic (list view)
-  let ASSIGN_TASK_ID = 0;
-  const AGENTS = {{ agents|tojson }};
-  function openAssignModal(taskId){
-    ASSIGN_TASK_ID = taskId;
-    const s = document.getElementById('assignSearch');
-    if(s) s.value='';
-    renderAssignList('');
-    document.getElementById('assignModal').classList.add('show');
-  }
-  function closeAssignModal(){ document.getElementById('assignModal').classList.remove('show'); }
-  function renderAssignList(q){
-    const box = document.getElementById('assignList');
-    const qq = String(q||'').toLowerCase();
-    const arr = (AGENTS||[]).filter(a=> String(a.username||'').toLowerCase().includes(qq) || String(a.id||'').includes(qq));
-    box.innerHTML='';
-    if(!arr.length){ box.innerHTML='<div class="help">Ничего не найдено</div>'; return; }
-    for(const a of arr){
-      const b = document.createElement('button');
-      b.className='iconbtn small';
-      b.textContent = a.username + ' (ID '+ a.id +')';
-      b.addEventListener('click', ()=> assignTo(a.id, a.username));
-      box.appendChild(b);
-    }
-  }
-  async function assignTo(uid, uname){
-    try{
-      const r = await fetch('/api/task/assign',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:ASSIGN_TASK_ID, assignee_id:uid})});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      closeAssignModal();
-      const sel = document.querySelector('.tk-assignee[data-id="'+ASSIGN_TASK_ID+'"]');
-      if(sel) sel.value = String(uid);
-      toast('Назначено: ' + (uname || j.assignee_name || ('#'+uid)));
-    }catch(_){ alert('Ошибка сети'); }
-  }
-  async function assignMe(taskId){
-    try{
-      const r = await fetch('/api/task/assign_me',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:taskId})});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      const sel = document.querySelector('.tk-assignee[data-id="'+taskId+'"]');
-      if(sel) sel.value = String(j.assignee_id||'');
-      toast('Задача назначена вам');
-    }catch(_){ alert('Ошибка сети'); }
-  }
-  document.getElementById('btnAssignCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeAssignModal(); });
-  document.getElementById('assignSearch')?.addEventListener('input', e=>{ renderAssignList(e.target.value||''); });
-  document.addEventListener('click', e=>{
-    const a=e.target.closest('.tk-assign'); if(a){ e.preventDefault(); const id=parseInt(a.getAttribute('data-id')||'0',10)||0; if(id) openAssignModal(id); return; }
-    const m=e.target.closest('.tk-assign-me'); if(m){ e.preventDefault(); const id=parseInt(m.getAttribute('data-id')||'0',10)||0; if(id) assignMe(id); return; }
-  });
-</script>
 """
 
 TASK_VIEW_TMPL = """
@@ -10387,8 +10248,6 @@ TASK_VIEW_TMPL = """
         <label>Описание <textarea class="input" id="tDesc" rows="4">{{ t.description or '' }}</textarea></label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
           <button class="button" id="btnSaveMain">Сохранить</button>
-          <button class="button secondary" id="btnAssignOpen">Назначить</button>
-          <button class="button" id="btnAssignMe">Назначить мне</button>
           <button class="iconbtn phone" id="btnDial"><span class="icon">📞</span><span>Позвонить</span></button>
           <a class="button ghost" href="{{ url_for('tasks_page') }}">← к списку</a>
         </div>
@@ -10587,7 +10446,6 @@ TASK_VIEW_TMPL = """
 <script nonce="{{ csp_nonce }}">
   const TID = {{ t.id }};
   let cAtt = [];
-  const AGENTS = [{% for u in query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(t.org_id,)) %}{id: {{ u.id }}, username: {{ u.username|tojson }} }{% if not loop.last %},{% endif %}{% endfor %}];
 
   async function tPatch(p){ return fetch('/api/task/update',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify(Object.assign({id:TID},p))}); }
   function toastErr(j){ alert(j && j.error ? j.error : 'Ошибка'); }
@@ -10621,47 +10479,6 @@ TASK_VIEW_TMPL = """
   }
   document.getElementById('btnDial')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dlgPhones').classList.add('show'); openPhones(); });
   document.getElementById('btnPhClose')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dlgPhones').classList.remove('show'); });
-  // Assign modal (detail view)
-  function openAssignModalView(){
-    const host = document.getElementById('assignModal');
-    if(!host) return;
-    document.getElementById('assignSearch')?.value='';
-    renderAssignListView('');
-    host.classList.add('show');
-  }
-  function closeAssignModalView(){ document.getElementById('assignModal')?.classList.remove('show'); }
-  function renderAssignListView(q){
-    const box = document.getElementById('assignList');
-    const qq = String(q||'').toLowerCase();
-    const arr = (AGENTS||[]).filter(a=> String(a.username||'').toLowerCase().includes(qq) || String(a.id||'').includes(qq));
-    box.innerHTML='';
-    if(!arr.length){ box.innerHTML='<div class="help">Ничего не найдено</div>'; return; }
-    for(const a of arr){
-      const b=document.createElement('button'); b.className='iconbtn small'; b.textContent=a.username+' (ID '+a.id+')';
-      b.addEventListener('click', async ()=>{
-        try{
-          const r=await fetch('/api/task/assign',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, assignee_id:a.id})});
-          const j=await r.json(); if(!j.ok){ alert(j.error||'Ошибка'); return; }
-          document.getElementById('tAssignee').value=String(a.id);
-          toast('Назначено: '+(a.username||''));
-          closeAssignModalView();
-        }catch(_){ alert('Ошибка сети'); }
-      });
-      box.appendChild(b);
-    }
-  }
-  document.getElementById('btnAssignOpen')?.addEventListener('click', e=>{ e.preventDefault(); openAssignModalView(); });
-  document.getElementById('btnAssignMe')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    try{
-      const r=await fetch('/api/task/assign_me',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID})});
-      const j=await r.json(); if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      if(j.assignee_id){ document.getElementById('tAssignee').value=String(j.assignee_id); }
-      toast('Задача назначена вам');
-    }catch(_){ alert('Ошибка сети'); }
-  });
-  document.getElementById('assignSearch')?.addEventListener('input', e=>{ renderAssignListView(e.target.value||''); });
-  document.getElementById('btnAssignCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeAssignModalView(); });
 
   document.getElementById('btnTpSave')?.addEventListener('click', async e=>{
     e.preventDefault();
@@ -10774,16 +10591,6 @@ TASK_VIEW_TMPL = """
     }catch(_){ alert('Ошибка'); }
   });
 </script>
-<div class="modal-backdrop" id="assignModal">
-  <div class="modal">
-    <h3>Назначить исполнителя</h3>
-    <input class="input" id="assignSearch" placeholder="Поиск пользователя (имя/ID)...">
-    <div id="assignList" style="max-height:50vh;overflow:auto;margin-top:8px;"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
-      <button class="button secondary" id="btnAssignCancel">Закрыть</button>
-    </div>
-  </div>
-</div>
 """
 # === END STYLES PART 3/9 ===
 # === STYLES PART 4/9 — DEALS LIST + KANBAN (filters, drag&drop, quick create/edit) ===
