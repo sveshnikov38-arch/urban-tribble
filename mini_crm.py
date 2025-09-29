@@ -9997,61 +9997,31 @@ THREAD_TMPL = """
 TASKS_TMPL = """
 <h2 style="margin:0 0 8px 0;">Задачи</h2>
 
-<div class="split">
-  <div class="card">
-    <details open>
-      <summary class="button ghost">Быстрое создание</summary>
-      <form method="post" style="display:grid;gap:8px;max-width:820px;">
-        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <label>Заголовок <input class="input" name="title" required placeholder="Что нужно сделать?"></label>
-        <label>Описание <textarea class="input" name="description" rows="3" placeholder="Краткое описание"></textarea></label>
-        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
-          <label>Исполнитель
-            <select class="select" name="assignee_id">
-              <option value="">—</option>
-              {% for a in agents %}<option value="{{ a.id }}">{{ a.username }}</option>{% endfor %}
-            </select>
-          </label>
-          <label>Срок <input class="input" type="datetime-local" name="due_at"></label>
-        </div>
-        <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
-          <label>ID клиента <input class="input" name="company_id" placeholder="например, 1"></label>
-          <label>ИНН клиента (альтерн.) <input class="input" name="company_inn" placeholder="10–12 цифр"></label>
-          <label>Абонплата, ₽ <input class="input" name="monthly_fee" type="number" step="0.01" value="0"></label>
-        </div>
-        <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
-          <button class="button" type="submit">Создать</button>
-          <a class="button ghost" href="{{ url_for('tasks_page') }}">Сбросить форму</a>
-        </div>
-      </form>
-    </details>
-  </div>
-
-  <div class="card">
-    <details open>
-      <summary class="button ghost">Фильтры</summary>
-      <form method="get" class="grid-filters" action="{{ url_for('tasks_page') }}">
-        <label>Период с <input class="input" type="date" name="created_from" value="{{ request.args.get('created_from','') }}"></label>
-        <label>по <input class="input" type="date" name="created_to" value="{{ request.args.get('created_to','') }}"></label>
-        <label>Фильтр
-          <select class="select" name="f">
-            {% set f = current_filter or request.args.get('f','open') %}
-            <option value="open" {% if f=='open' %}selected{% endif %}>Открытые</option>
-            <option value="today" {% if f=='today' %}selected{% endif %}>Сегодня</option>
-            <option value="overdue" {% if f=='overdue' %}selected{% endif %}>Просроченные</option>
-            <option value="done" {% if f=='done' %}selected{% endif %}>Сделанные</option>
-          </select>
-        </label>
-        <label>Поиск <input class="input" name="q" placeholder="в заголовке/описании" value="{{ request.args.get('q','') }}"></label>
-        <label>Адрес <input class="input" name="address" value="{{ request.args.get('address','') }}"></label>
-        <label>Телефон <input class="input" name="contact_phone" value="{{ request.args.get('contact_phone','') }}"></label>
-        <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;margin-top:4px;">
-          <button class="button" type="submit">Применить</button>
-          <a class="button ghost" href="{{ url_for('tasks_page') }}">Сбросить</a>
-        </div>
-      </form>
-    </details>
-  </div>
+<div class="card">
+  <details open>
+    <summary class="button ghost">Фильтры</summary>
+    <form method="get" class="grid-filters" action="{{ url_for('tasks_page') }}">
+      <label>Период с <input class="input" type="date" name="created_from" value="{{ request.args.get('created_from','') }}"></label>
+      <label>по <input class="input" type="date" name="created_to" value="{{ request.args.get('created_to','') }}"></label>
+      <label>Фильтр
+        <select class="select" name="f">
+          {% set f = current_filter or request.args.get('f','open') %}
+          <option value="open" {% if f=='open' %}selected{% endif %}>Открытые</option>
+          <option value="today" {% if f=='today' %}selected{% endif %}>Сегодня</option>
+          <option value="overdue" {% if f=='overdue' %}selected{% endif %}>Просроченные</option>
+          <option value="done" {% if f=='done' %}selected{% endif %}>Сделанные</option>
+        </select>
+      </label>
+      <label>Поиск <input class="input" name="q" placeholder="в заголовке/описании" value="{{ request.args.get('q','') }}"></label>
+      <label>Адрес <input class="input" name="address" value="{{ request.args.get('address','') }}"></label>
+      <label>Телефон <input class="input" name="contact_phone" value="{{ request.args.get('contact_phone','') }}"></label>
+      <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;margin-top:4px;">
+        <button class="button" type="submit">Применить</button>
+        <a class="button ghost" href="{{ url_for('tasks_page') }}">Сбросить</a>
+      </div>
+    </form>
+  </details>
+  
 </div>
 
 <div class="card" style="margin-top:10px;">
@@ -10206,6 +10176,48 @@ TASKS_TMPL = """
     if(e.key.toLowerCase()==='x'){ e.preventDefault(); taskToggle(parseInt(id,10)); }
   });
 </script>
+<style>
+  .fab{position:fixed;left:18px;bottom:18px;z-index:9999}
+  .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
+  .fab .plus:hover{filter:brightness(0.95)}
+  .fab .plus:focus{outline:2px solid var(--border)}
+</style>
+<div class="modal-backdrop" id="taskModal">
+  <div class="modal">
+    <h3>Новая задача</h3>
+    <form method="post" action="{{ url_for('tasks_page') }}" style="display:grid;gap:8px;max-width:820px;">
+      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+      <label>Заголовок <input class="input" name="title" required placeholder="Что нужно сделать?"></label>
+      <label>Описание <textarea class="input" name="description" rows="3" placeholder="Краткое описание"></textarea></label>
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+        <label>Исполнитель
+          <select class="select" name="assignee_id">
+            <option value="">—</option>
+            {% for a in agents %}<option value="{{ a.id }}">{{ a.username }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Срок <input class="input" type="datetime-local" name="due_at"></label>
+      </div>
+      <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <label>ID клиента <input class="input" name="company_id" placeholder="например, 1"></label>
+        <label>ИНН клиента (альтерн.) <input class="input" name="company_inn" placeholder="10–12 цифр"></label>
+        <label>Абонплата, ₽ <input class="input" name="monthly_fee" type="number" step="0.01" value="0"></label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+        <button class="button secondary" type="button" id="btnTaskCancel">Отмена</button>
+        <button class="button" type="submit">Создать</button>
+      </div>
+    </form>
+  </div>
+  
+</div>
+<div class="fab">
+  <button class="plus" id="btnFabTask" title="новая задача">+</button>
+  <script nonce="{{ csp_nonce }}">
+    document.getElementById('btnFabTask')?.addEventListener('click', (e)=>{ e.preventDefault(); document.getElementById('taskModal').classList.add('show'); });
+    document.getElementById('btnTaskCancel')?.addEventListener('click', (e)=>{ e.preventDefault(); document.getElementById('taskModal').classList.remove('show'); });
+  </script>
+</div>
 """
 
 TASK_VIEW_TMPL = """
@@ -10243,8 +10255,9 @@ TASK_VIEW_TMPL = """
     </div>
 
     <div class="card" style="margin-bottom:10px;">
-      <h3>Комментарии</h3>
-      <div id="cmList" style="max-height:60vh;overflow:auto;">
+      <details open>
+        <summary class="button ghost">Комментарии</summary>
+        <div id="cmList" style="max-height:60vh;overflow:auto;">
         {% for c in comments %}
         <div class="msg agent" data-id="{{ c.id }}">
           <div class="meta">[{{ c.username or ('#'+(c.user_id|string)) }}] {{ c.created_at }}</div>
@@ -10259,8 +10272,8 @@ TASK_VIEW_TMPL = """
         {% else %}
         <div class="help">Комментариев пока нет</div>
         {% endfor %}
-      </div>
-      <div class="composer" style="margin-top:8px;">
+        </div>
+        <div class="composer" style="margin-top:8px;">
         <div id="cDrop" style="border:2px dashed var(--border);padding:10px;text-align:center;cursor:pointer;">Перетащите файлы или кликните для загрузки</div>
         <input type="file" id="cFile" multiple style="display:none;">
         <div id="cAtt" class="help" style="margin:6px 0;display:none;"></div>
@@ -10275,23 +10288,27 @@ TASK_VIEW_TMPL = """
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
           <button class="button" id="btnAddComment">Добавить комментарий</button>
         </div>
-      </div>
+        </div>
+      </details>
     </div>
   </div>
 
   <div>
     <div class="card">
-      <h3>Сведения</h3>
+      <details open>
+        <summary class="button ghost">Сведения</summary>
       <div><strong>ID:</strong> {{ t.id }}</div>
       <div><strong>Клиент:</strong> {{ t.company_name or '—' }}</div>
       <div><strong>Абонплата:</strong> {{ '%.2f'|format((t.monthly_fee or 0)|float) }} ₽</div>
       <div style="margin-top:8px;"><strong>FRT:</strong>
         {% if t.last_commented_at %}<span class="help">посл. коммент: {{ t.last_commented_at }}</span>{% else %}<span class="help">—</span>{% endif %}
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Участники</h3>
+      <details>
+        <summary class="button ghost">Участники</summary>
       <ul>
         {% for p in participants %}
           <li>#{{ p.user_id }} — {{ p.username or '' }} <span class="help">({{ p.role }})</span></li>
@@ -10321,10 +10338,12 @@ TASK_VIEW_TMPL = """
         </label>
         <button class="button" id="btnTpSave">Обновить</button>
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Напоминания</h3>
+      <details>
+        <summary class="button ghost">Напоминания</summary>
       <div id="remList" class="help">Загрузка...</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
         <label>Когда <input class="input" type="datetime-local" id="remWhen"></label>
@@ -10333,10 +10352,12 @@ TASK_VIEW_TMPL = """
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
         <button class="button" id="btnRemAdd">Добавить</button>
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Перевод по стадии/отделу</h3>
+      <details>
+        <summary class="button ghost">Перевод по стадии/отделу</summary>
       <div class="help">Введите ключ стадии (workflow_stages.key) и/или ID отдела</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
         <label>Стадия <input class="input" id="wfStage" placeholder="например, in_progress"></label>
@@ -10349,10 +10370,12 @@ TASK_VIEW_TMPL = """
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
         <button class="button" id="btnWfApply">Применить</button>
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Делегирование</h3>
+      <details>
+        <summary class="button ghost">Делегирование</summary>
       <div style="display:flex;gap:8px;align-items:end;">
         <label>Назначить пользователю
           <select class="select" id="dlgUser">
@@ -10363,10 +10386,12 @@ TASK_VIEW_TMPL = """
         </label>
         <button class="button" id="btnDelegate">Делегировать</button>
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Файлы (закреплённые)</h3>
+      <details>
+        <summary class="button ghost">Файлы (закреплённые)</summary>
       <div id="pinList">
         {% for f in pinned_files %}
           <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
@@ -10381,10 +10406,12 @@ TASK_VIEW_TMPL = """
         <label>ID файла <input class="input" id="pinFileId" placeholder="Например, 10" style="max-width:140px;"></label>
         <button class="button" id="btnPin">Закрепить</button>
       </div>
+      </details>
     </div>
 
     <div class="card">
-      <h3>Переходы и активность</h3>
+      <details>
+        <summary class="button ghost">Переходы и активность</summary>
       <div class="help">Последние переходы стадии</div>
       <ul>
         {% for tr in transitions %}
@@ -10401,6 +10428,7 @@ TASK_VIEW_TMPL = """
         <li class="help">Нет активности</li>
         {% endfor %}
       </ul>
+      </details>
     </div>
   </div>
 </div>
@@ -10700,7 +10728,8 @@ DEALS_TMPL = """
 
   function esc(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 
-  const USERS = {{ query_db("SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username",(user.org_id,))|tojson }};
+  // Use users passed from the view (already converted to plain dicts)
+  const USERS = {{ users|tojson }};
 
   function cardHTML(it){
     const assgn = it.assignee_id ? ('#'+it.assignee_id) : '—';
@@ -10892,6 +10921,18 @@ DEALS_TMPL = """
 
   loadKanban();
 </script>
+<style>
+  .fab{position:fixed;left:18px;bottom:18px;z-index:9999}
+  .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
+  .fab .plus:hover{filter:brightness(0.95)}
+  .fab .plus:focus{outline:2px solid var(--border)}
+</style>
+<div class="fab">
+  <button class="plus" id="btnFabDeal" title="новая сделка">+</button>
+  <script nonce="{{ csp_nonce }}">
+    document.getElementById('btnFabDeal')?.addEventListener('click', (e)=>{ e.preventDefault(); openDealModal(); });
+  </script>
+</div>
 """
 # === END STYLES PART 4/9 ===
 # === STYLES PART 5/9 — CLIENTS (list/detail) + CALLS (list/filters), badges/chips/pagination ===
