@@ -7530,7 +7530,8 @@ def deals_page():
         rows = query_db(f"SELECT * FROM deals WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", tuple(params))
         users_rows = query_db("SELECT id, username FROM users WHERE org_id=? AND active=1 ORDER BY username", (org_id,))
         users = [dict(u) for u in (users_rows or [])]
-        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users)
+        users_map = {int(u["id"]): (u["username"] or "") for u in users}
+        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users, users_map=users_map)
         return render_safe(LAYOUT_TMPL, inner=inner)
     except Exception as e:
         app.logger.exception(f"Deals page error: {e}")
