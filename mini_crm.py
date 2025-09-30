@@ -7530,7 +7530,8 @@ def deals_page():
         rows = query_db(f"SELECT * FROM deals WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 500", tuple(params))
         users_rows = query_db("SELECT id, username FROM users WHERE org_id=? AND active=1 ORDER BY username", (org_id,))
         users = [dict(u) for u in (users_rows or [])]
-        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users)
+        users_map = {int(u["id"]): (u["username"] or "") for u in users}
+        inner = render_safe(DEALS_TMPL, deals=[dict(r) for r in (rows or [])], users=users, users_map=users_map)
         return render_safe(LAYOUT_TMPL, inner=inner)
     except Exception as e:
         app.logger.exception(f"Deals page error: {e}")
@@ -12544,6 +12545,148 @@ details>summary.button::-webkit-details-marker{display:none}
 """
 
 # --- Extra routes/helpers appended in this section ---
+
+# Reports: tasks daily aggregates
+@app.route("/api/reports/tasks_daily")
+@login_required
+def api_reports_tasks_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+
+        # Created per day + monthly fee sum by created date
+        where_created = ["org_id=?"]
+        p_created = [org_id]
+        if df:
+            where_created.append("created_at>=?"); p_created.append(df)
+        if dt:
+            where_created.append("created_at<=?"); p_created.append(dt)
+        rows_created = query_db(
+            f"""
+            SELECT substr(created_at,1,10) AS ymd,
+                   COUNT(1) AS created_cnt,
+                   COALESCE(SUM(monthly_fee),0) AS monthly_fee_sum
+            FROM tasks
+            WHERE {' AND '.join(where_created)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_created),
+        )
+
+        # Done per day by updated_at when status is 'done'
+        where_done = ["org_id=?", "status='done'"]
+        p_done = [org_id]
+        if df:
+            where_done.append("updated_at>=?"); p_done.append(df)
+        if dt:
+            where_done.append("updated_at<=?"); p_done.append(dt)
+        rows_done = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS done_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_done)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_done),
+        )
+
+        # Overdue per day by updated_at when status is 'overdue'
+        where_over = ["org_id=?", "status='overdue'"]
+        p_over = [org_id]
+        if df:
+            where_over.append("updated_at>=?"); p_over.append(df)
+        if dt:
+            where_over.append("updated_at<=?"); p_over.append(dt)
+        rows_over = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS overdue_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_over)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_over),
+        )
+
+        # Merge by ymd
+        agg = {}
+        for r in (rows_created or []):
+            y = r["ymd"]
+            agg[y] = {
+                "ymd": y,
+                "created_cnt": int(r["created_cnt"] or 0),
+                "monthly_fee_sum": float(r["monthly_fee_sum"] or 0.0),
+            }
+        for r in (rows_done or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["done_cnt"] = int(r["done_cnt"] or 0)
+        for r in (rows_over or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["overdue_cnt"] = int(r["overdue_cnt"] or 0)
+
+        items = [
+            {
+                "ymd": k,
+                "created_cnt": int(v.get("created_cnt", 0)),
+                "done_cnt": int(v.get("done_cnt", 0)),
+                "overdue_cnt": int(v.get("overdue_cnt", 0)),
+                "monthly_fee_sum": float(v.get("monthly_fee_sum", 0.0)),
+            }
+            for k, v in sorted(agg.items())
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"tasks_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
+
+
+# Reports: calls daily aggregates
+@app.route("/api/reports/calls_daily")
+@login_required
+def api_reports_calls_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+        where_ = ["org_id=?"]
+        params = [org_id]
+        if df:
+            where_.append("started_at>=?"); params.append(df)
+        if dt:
+            where_.append("started_at<=?"); params.append(dt)
+        rows = query_db(
+            f"""
+            SELECT substr(started_at,1,10) AS ymd,
+                   SUM(CASE WHEN direction='in' THEN 1 ELSE 0 END) AS in_cnt,
+                   SUM(CASE WHEN direction='out' THEN 1 ELSE 0 END) AS out_cnt,
+                   COALESCE(SUM(COALESCE(duration_sec,0)),0) AS dur_sum
+            FROM calls
+            WHERE {' AND '.join(where_)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(params),
+        )
+        items = [
+            {
+                "ymd": r["ymd"],
+                "in_cnt": int(r["in_cnt"] or 0),
+                "out_cnt": int(r["out_cnt"] or 0),
+                "dur_sum": int(r["dur_sum"] or 0),
+            }
+            for r in (rows or [])
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"calls_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
 
 # Навбар ссылается на /analytics; рендер простого шаблона аналитики
 @app.route("/analytics")
