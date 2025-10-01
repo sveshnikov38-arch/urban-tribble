@@ -1751,6 +1751,10 @@ def ensure_indexes():
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_last_comment ON tasks(last_commented_at)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_contact_person ON tasks(contact_person_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_deal ON tasks(deal_id)")
+    # new: subtasks/time tracking
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)")
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_timer_started ON tasks(timer_started_at)")
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_time_spent ON tasks(time_spent_sec)")
 
     # task_comments
     exec_db("CREATE INDEX IF NOT EXISTS idx_tcomments_org ON task_comments(org_id)")
@@ -3379,6 +3383,14 @@ def _migration_13_api_tokens_refactor():
         _metrics_inc("migrations_errors_total", ("v13",))
 
 
+# ---------- v14: Tasks time tracking + subtasks columns ----------
+def _migration_14_tasks_time_tracking_subtasks():
+    # Add new columns to tasks for time tracking and subtasks hierarchy
+    ensure_column("tasks", "time_spent_sec", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("tasks", "timer_started_at", "DATETIME")
+    ensure_column("tasks", "parent_task_id", "INTEGER")
+
+
 def ensure_schema():
     exec_db("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL, applied_at DATETIME)")
     if not query_db("SELECT 1 FROM schema_meta LIMIT 1", one=True):
@@ -3419,6 +3431,7 @@ def ensure_schema():
         _migration_11_analytics_aggregates,            # v11
         _migration_12_tokens_and_mail_imap,            # v12
         _migration_13_api_tokens_refactor,             # v13
+        _migration_14_tasks_time_tracking_subtasks,    # v14
     ]
 
     try:
