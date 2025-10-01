@@ -7127,78 +7127,6 @@ def api_task_delegate():
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Assign endpoints -------------------
-@app.route("/api/task/assign", methods=["POST"])
-@login_required
-def api_task_assign():
-    try:
-        verify_csrf_header()
-        org_id = current_org_id()
-        d = request.get_json(force=True) or {}
-        task_id = int(d.get("task_id") or 0)
-        assignee_id = int(d.get("assignee_id") or 0)
-        if not task_id or not assignee_id:
-            return jsonify(ok=False, error="bad request"), 400
-        t = query_db("SELECT * FROM tasks WHERE id=? AND org_id=?", (task_id, org_id), one=True)
-        if not t:
-            return jsonify(ok=False, error="not found"), 404
-        if not can_edit_task(session["user_id"], t):
-            return jsonify(ok=False, error="forbidden"), 403
-        if not query_db("SELECT 1 FROM users WHERE id=? AND org_id=? AND active=1", (assignee_id, org_id), one=True):
-            return jsonify(ok=False, error="assignee out of org"), 400
-        exec_db("UPDATE tasks SET assignee_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (assignee_id, task_id, org_id))
-        _ = exec_db("INSERT INTO task_participants (org_id,task_id,user_id,role) VALUES (?,?,?,?)", (org_id, task_id, assignee_id, "assignee"))
-        add_task_activity(org_id, task_id, session["user_id"], "assignee_set", {"assignee_id": assignee_id})
-        try:
-            u = query_db("SELECT username FROM users WHERE id=?", (assignee_id,), one=True)
-            uname = (u["username"] if u else str(assignee_id))
-            notify_user(assignee_id, "Вам назначена задача", f"Задача #{task_id}", url_for("task_view", tid=task_id, _external=True))
-            sse_publish_users([assignee_id], "task.assigned", {"task_id": task_id, "assignee_id": assignee_id})
-            add_audit(org_id, "task.assigned", "task", task_id, {"assignee_id": assignee_id})
-            fire_event("task.updated", org_id, {"task_id": task_id, "assignee_id": assignee_id})
-        except Exception:
-            uname = str(assignee_id)
-            pass
-        return jsonify(ok=True, assignee_id=assignee_id, assignee_name=uname)
-    except Exception as e:
-        app.logger.exception(f"Task assign error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
-
-
-@app.route("/api/task/assign_me", methods=["POST"])
-@login_required
-def api_task_assign_me():
-    try:
-        verify_csrf_header()
-        org_id = current_org_id()
-        d = request.get_json(force=True) or {}
-        task_id = int(d.get("task_id") or 0)
-        if not task_id:
-            return jsonify(ok=False, error="bad request"), 400
-        t = query_db("SELECT * FROM tasks WHERE id=? AND org_id=?", (task_id, org_id), one=True)
-        if not t:
-            return jsonify(ok=False, error="not found"), 404
-        if not can_edit_task(session["user_id"], t):
-            return jsonify(ok=False, error="forbidden"), 403
-        assignee_id = int(session["user_id"])  # current user
-        exec_db("UPDATE tasks SET assignee_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (assignee_id, task_id, org_id))
-        _ = exec_db("INSERT INTO task_participants (org_id,task_id,user_id,role) VALUES (?,?,?,?)", (org_id, task_id, assignee_id, "assignee"))
-        add_task_activity(org_id, task_id, session["user_id"], "assignee_set", {"assignee_id": assignee_id, "self": True})
-        try:
-            u = query_db("SELECT username FROM users WHERE id=?", (assignee_id,), one=True)
-            uname = (u["username"] if u else str(assignee_id))
-            notify_user(assignee_id, "Задача назначена вам", f"Задача #{task_id}", url_for("task_view", tid=task_id, _external=True))
-            sse_publish_users([assignee_id], "task.assigned", {"task_id": task_id, "assignee_id": assignee_id})
-            add_audit(org_id, "task.assigned_me", "task", task_id, {"assignee_id": assignee_id})
-            fire_event("task.updated", org_id, {"task_id": task_id, "assignee_id": assignee_id})
-        except Exception:
-            uname = str(assignee_id)
-            pass
-        return jsonify(ok=True, assignee_id=assignee_id, assignee_name=uname)
-    except Exception as e:
-        app.logger.exception(f"Task assign_me error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
-
 # ------------------- Task detail page + Comments API + Pin files -------------------
 @app.route("/task/<int:tid>")
 @login_required
@@ -10131,8 +10059,6 @@ TASKS_TMPL = """
         <td style="white-space:nowrap;display:flex;gap:6px;align-items:center;">
           <button class="iconbtn small tk-toggle" data-id="{{ t.id }}" title="Готово/открыть">⏺</button>
           <a class="iconbtn small" href="{{ url_for('task_view', tid=t.id) }}">Открыть</a>
-          <button class="iconbtn small tk-assign" data-id="{{ t.id }}" title="Назначить">👤</button>
-          <button class="iconbtn small tk-assign-me" data-id="{{ t.id }}" title="Назначить мне">🙋</button>
           <button class="iconbtn small tk-dial" data-id="{{ t.id }}" title="Позвонить">📞</button>
         </td>
       </tr>
@@ -10286,16 +10212,6 @@ TASKS_TMPL = """
   </div>
   
 </div>
-<div class="modal-backdrop" id="assignModal">
-  <div class="modal">
-    <h3>Назначение задачи</h3>
-    <input class="input" id="assignSearch" placeholder="Поиск пользователя (имя/ID)...">
-    <div id="assignList" style="max-height:50vh;overflow:auto;margin-top:8px;"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
-      <button class="button secondary" id="btnAssignCancel">Отмена</button>
-    </div>
-  </div>
-</div>
 <div class="fab">
   <button class="plus" id="btnFabTask" title="новая задача">+</button>
   <script nonce="{{ csp_nonce }}">
@@ -10303,60 +10219,6 @@ TASKS_TMPL = """
     document.getElementById('btnTaskCancel')?.addEventListener('click', (e)=>{ e.preventDefault(); document.getElementById('taskModal').classList.remove('show'); });
   </script>
 </div>
-<script nonce="{{ csp_nonce }}">
-  // Assignment modal logic (list view)
-  let ASSIGN_TASK_ID = 0;
-  const AGENTS = {{ agents|tojson }};
-  function openAssignModal(taskId){
-    ASSIGN_TASK_ID = taskId;
-    const s = document.getElementById('assignSearch');
-    if(s) s.value='';
-    renderAssignList('');
-    document.getElementById('assignModal').classList.add('show');
-  }
-  function closeAssignModal(){ document.getElementById('assignModal').classList.remove('show'); }
-  function renderAssignList(q){
-    const box = document.getElementById('assignList');
-    const qq = String(q||'').toLowerCase();
-    const arr = (AGENTS||[]).filter(a=> String(a.username||'').toLowerCase().includes(qq) || String(a.id||'').includes(qq));
-    box.innerHTML='';
-    if(!arr.length){ box.innerHTML='<div class="help">Ничего не найдено</div>'; return; }
-    for(const a of arr){
-      const b = document.createElement('button');
-      b.className='iconbtn small';
-      b.textContent = a.username + ' (ID '+ a.id +')';
-      b.addEventListener('click', ()=> assignTo(a.id, a.username));
-      box.appendChild(b);
-    }
-  }
-  async function assignTo(uid, uname){
-    try{
-      const r = await fetch('/api/task/assign',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:ASSIGN_TASK_ID, assignee_id:uid})});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      closeAssignModal();
-      const sel = document.querySelector('.tk-assignee[data-id="'+ASSIGN_TASK_ID+'"]');
-      if(sel) sel.value = String(uid);
-      toast('Назначено: ' + (uname || j.assignee_name || ('#'+uid)));
-    }catch(_){ alert('Ошибка сети'); }
-  }
-  async function assignMe(taskId){
-    try{
-      const r = await fetch('/api/task/assign_me',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:taskId})});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      const sel = document.querySelector('.tk-assignee[data-id="'+taskId+'"]');
-      if(sel) sel.value = String(j.assignee_id||'');
-      toast('Задача назначена вам');
-    }catch(_){ alert('Ошибка сети'); }
-  }
-  document.getElementById('btnAssignCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeAssignModal(); });
-  document.getElementById('assignSearch')?.addEventListener('input', e=>{ renderAssignList(e.target.value||''); });
-  document.addEventListener('click', e=>{
-    const a=e.target.closest('.tk-assign'); if(a){ e.preventDefault(); const id=parseInt(a.getAttribute('data-id')||'0',10)||0; if(id) openAssignModal(id); return; }
-    const m=e.target.closest('.tk-assign-me'); if(m){ e.preventDefault(); const id=parseInt(m.getAttribute('data-id')||'0',10)||0; if(id) assignMe(id); return; }
-  });
-</script>
 """
 
 TASK_VIEW_TMPL = """
@@ -10387,8 +10249,6 @@ TASK_VIEW_TMPL = """
         <label>Описание <textarea class="input" id="tDesc" rows="4">{{ t.description or '' }}</textarea></label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
           <button class="button" id="btnSaveMain">Сохранить</button>
-          <button class="button secondary" id="btnAssignOpen">Назначить</button>
-          <button class="button" id="btnAssignMe">Назначить мне</button>
           <button class="iconbtn phone" id="btnDial"><span class="icon">📞</span><span>Позвонить</span></button>
           <a class="button ghost" href="{{ url_for('tasks_page') }}">← к списку</a>
         </div>
@@ -10587,7 +10447,6 @@ TASK_VIEW_TMPL = """
 <script nonce="{{ csp_nonce }}">
   const TID = {{ t.id }};
   let cAtt = [];
-  const AGENTS = [{% for u in query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(t.org_id,)) %}{id: {{ u.id }}, username: {{ u.username|tojson }} }{% if not loop.last %},{% endif %}{% endfor %}];
 
   async function tPatch(p){ return fetch('/api/task/update',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify(Object.assign({id:TID},p))}); }
   function toastErr(j){ alert(j && j.error ? j.error : 'Ошибка'); }
@@ -10621,47 +10480,6 @@ TASK_VIEW_TMPL = """
   }
   document.getElementById('btnDial')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dlgPhones').classList.add('show'); openPhones(); });
   document.getElementById('btnPhClose')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dlgPhones').classList.remove('show'); });
-  // Assign modal (detail view)
-  function openAssignModalView(){
-    const host = document.getElementById('assignModal');
-    if(!host) return;
-    document.getElementById('assignSearch')?.value='';
-    renderAssignListView('');
-    host.classList.add('show');
-  }
-  function closeAssignModalView(){ document.getElementById('assignModal')?.classList.remove('show'); }
-  function renderAssignListView(q){
-    const box = document.getElementById('assignList');
-    const qq = String(q||'').toLowerCase();
-    const arr = (AGENTS||[]).filter(a=> String(a.username||'').toLowerCase().includes(qq) || String(a.id||'').includes(qq));
-    box.innerHTML='';
-    if(!arr.length){ box.innerHTML='<div class="help">Ничего не найдено</div>'; return; }
-    for(const a of arr){
-      const b=document.createElement('button'); b.className='iconbtn small'; b.textContent=a.username+' (ID '+a.id+')';
-      b.addEventListener('click', async ()=>{
-        try{
-          const r=await fetch('/api/task/assign',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, assignee_id:a.id})});
-          const j=await r.json(); if(!j.ok){ alert(j.error||'Ошибка'); return; }
-          document.getElementById('tAssignee').value=String(a.id);
-          toast('Назначено: '+(a.username||''));
-          closeAssignModalView();
-        }catch(_){ alert('Ошибка сети'); }
-      });
-      box.appendChild(b);
-    }
-  }
-  document.getElementById('btnAssignOpen')?.addEventListener('click', e=>{ e.preventDefault(); openAssignModalView(); });
-  document.getElementById('btnAssignMe')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    try{
-      const r=await fetch('/api/task/assign_me',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID})});
-      const j=await r.json(); if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      if(j.assignee_id){ document.getElementById('tAssignee').value=String(j.assignee_id); }
-      toast('Задача назначена вам');
-    }catch(_){ alert('Ошибка сети'); }
-  });
-  document.getElementById('assignSearch')?.addEventListener('input', e=>{ renderAssignListView(e.target.value||''); });
-  document.getElementById('btnAssignCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeAssignModalView(); });
 
   document.getElementById('btnTpSave')?.addEventListener('click', async e=>{
     e.preventDefault();
@@ -10774,16 +10592,6 @@ TASK_VIEW_TMPL = """
     }catch(_){ alert('Ошибка'); }
   });
 </script>
-<div class="modal-backdrop" id="assignModal">
-  <div class="modal">
-    <h3>Назначить исполнителя</h3>
-    <input class="input" id="assignSearch" placeholder="Поиск пользователя (имя/ID)...">
-    <div id="assignList" style="max-height:50vh;overflow:auto;margin-top:8px;"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
-      <button class="button secondary" id="btnAssignCancel">Закрыть</button>
-    </div>
-  </div>
-</div>
 """
 # === END STYLES PART 3/9 ===
 # === STYLES PART 4/9 — DEALS LIST + KANBAN (filters, drag&drop, quick create/edit) ===
@@ -12737,6 +12545,148 @@ details>summary.button::-webkit-details-marker{display:none}
 """
 
 # --- Extra routes/helpers appended in this section ---
+
+# Reports: tasks daily aggregates
+@app.route("/api/reports/tasks_daily")
+@login_required
+def api_reports_tasks_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+
+        # Created per day + monthly fee sum by created date
+        where_created = ["org_id=?"]
+        p_created = [org_id]
+        if df:
+            where_created.append("created_at>=?"); p_created.append(df)
+        if dt:
+            where_created.append("created_at<=?"); p_created.append(dt)
+        rows_created = query_db(
+            f"""
+            SELECT substr(created_at,1,10) AS ymd,
+                   COUNT(1) AS created_cnt,
+                   COALESCE(SUM(monthly_fee),0) AS monthly_fee_sum
+            FROM tasks
+            WHERE {' AND '.join(where_created)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_created),
+        )
+
+        # Done per day by updated_at when status is 'done'
+        where_done = ["org_id=?", "status='done'"]
+        p_done = [org_id]
+        if df:
+            where_done.append("updated_at>=?"); p_done.append(df)
+        if dt:
+            where_done.append("updated_at<=?"); p_done.append(dt)
+        rows_done = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS done_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_done)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_done),
+        )
+
+        # Overdue per day by updated_at when status is 'overdue'
+        where_over = ["org_id=?", "status='overdue'"]
+        p_over = [org_id]
+        if df:
+            where_over.append("updated_at>=?"); p_over.append(df)
+        if dt:
+            where_over.append("updated_at<=?"); p_over.append(dt)
+        rows_over = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS overdue_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_over)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_over),
+        )
+
+        # Merge by ymd
+        agg = {}
+        for r in (rows_created or []):
+            y = r["ymd"]
+            agg[y] = {
+                "ymd": y,
+                "created_cnt": int(r["created_cnt"] or 0),
+                "monthly_fee_sum": float(r["monthly_fee_sum"] or 0.0),
+            }
+        for r in (rows_done or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["done_cnt"] = int(r["done_cnt"] or 0)
+        for r in (rows_over or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["overdue_cnt"] = int(r["overdue_cnt"] or 0)
+
+        items = [
+            {
+                "ymd": k,
+                "created_cnt": int(v.get("created_cnt", 0)),
+                "done_cnt": int(v.get("done_cnt", 0)),
+                "overdue_cnt": int(v.get("overdue_cnt", 0)),
+                "monthly_fee_sum": float(v.get("monthly_fee_sum", 0.0)),
+            }
+            for k, v in sorted(agg.items())
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"tasks_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
+
+
+# Reports: calls daily aggregates
+@app.route("/api/reports/calls_daily")
+@login_required
+def api_reports_calls_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+        where_ = ["org_id=?"]
+        params = [org_id]
+        if df:
+            where_.append("started_at>=?"); params.append(df)
+        if dt:
+            where_.append("started_at<=?"); params.append(dt)
+        rows = query_db(
+            f"""
+            SELECT substr(started_at,1,10) AS ymd,
+                   SUM(CASE WHEN direction='in' THEN 1 ELSE 0 END) AS in_cnt,
+                   SUM(CASE WHEN direction='out' THEN 1 ELSE 0 END) AS out_cnt,
+                   COALESCE(SUM(COALESCE(duration_sec,0)),0) AS dur_sum
+            FROM calls
+            WHERE {' AND '.join(where_)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(params),
+        )
+        items = [
+            {
+                "ymd": r["ymd"],
+                "in_cnt": int(r["in_cnt"] or 0),
+                "out_cnt": int(r["out_cnt"] or 0),
+                "dur_sum": int(r["dur_sum"] or 0),
+            }
+            for r in (rows or [])
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"calls_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
 
 # Навбар ссылается на /analytics; рендер простого шаблона аналитики
 @app.route("/analytics")
