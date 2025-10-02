@@ -1751,6 +1751,10 @@ def ensure_indexes():
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_last_comment ON tasks(last_commented_at)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_contact_person ON tasks(contact_person_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_deal ON tasks(deal_id)")
+    # new: subtasks/time tracking
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)")
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_timer_started ON tasks(timer_started_at)")
+    exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_time_spent ON tasks(time_spent_sec)")
 
     # task_comments
     exec_db("CREATE INDEX IF NOT EXISTS idx_tcomments_org ON task_comments(org_id)")
@@ -1880,6 +1884,20 @@ def ensure_indexes():
     if _object_exists("table", "quotes"):
         exec_db("CREATE INDEX IF NOT EXISTS idx_quotes_org ON quotes(org_id)")
         exec_db("CREATE INDEX IF NOT EXISTS idx_quotes_deal ON quotes(deal_id)")
+
+    # documents/inventory (guarded)
+    if _object_exists("table", "documents_templates"):
+        exec_db("CREATE INDEX IF NOT EXISTS idx_doc_tmpl_org ON documents_templates(org_id)")
+        exec_db("CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_tmpl_key ON documents_templates(org_id, tkey) WHERE tkey IS NOT NULL")
+        exec_db("CREATE INDEX IF NOT EXISTS idx_doc_tmpl_type ON documents_templates(type)")
+    if _object_exists("table", "documents"):
+        exec_db("CREATE INDEX IF NOT EXISTS idx_docs_org ON documents(org_id)")
+        exec_db("CREATE INDEX IF NOT EXISTS idx_docs_tmpl ON documents(template_id)")
+        exec_db("CREATE INDEX IF NOT EXISTS idx_docs_company ON documents(company_id)")
+        exec_db("CREATE INDEX IF NOT EXISTS idx_docs_created ON documents(created_at)")
+    if _object_exists("table", "inventory"):
+        exec_db("CREATE INDEX IF NOT EXISTS idx_inv_org ON inventory(org_id)")
+        exec_db("CREATE UNIQUE INDEX IF NOT EXISTS uq_inv_org_prod ON inventory(org_id, product_id)")
 
     # analytics aggregates (guarded)
     if _object_exists("table", "agg_task_daily"):
@@ -3379,6 +3397,71 @@ def _migration_13_api_tokens_refactor():
         _metrics_inc("migrations_errors_total", ("v13",))
 
 
+# ---------- v14: Tasks time tracking + subtasks columns ----------
+def _migration_14_tasks_time_tracking_subtasks():
+    # Add new columns to tasks for time tracking and subtasks hierarchy
+    ensure_column("tasks", "time_spent_sec", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("tasks", "timer_started_at", "DATETIME")
+    ensure_column("tasks", "parent_task_id", "INTEGER")
+
+
+# ---------- v15: Documents/Templates + Inventory (Warehouse) ----------
+def _migration_15_documents_and_inventory():
+    # Documents templates
+    exec_db(
+        """
+        CREATE TABLE IF NOT EXISTS documents_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,             -- contract | invoice | proposal
+            tkey TEXT,                      -- optional short key/slug
+            body_template TEXT NOT NULL,    -- Jinja-like HTML template
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    # Documents instances
+    exec_db(
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            template_id INTEGER,
+            doc_type TEXT NOT NULL,
+            company_id INTEGER,
+            deal_id INTEGER,
+            user_id INTEGER,
+            title TEXT NOT NULL,
+            content_html TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE,
+            FOREIGN KEY (template_id) REFERENCES documents_templates(id) ON DELETE SET NULL,
+            FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL,
+            FOREIGN KEY (deal_id) REFERENCES deals(id) ON DELETE SET NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        );
+        """
+    )
+
+    # Inventory (per product)
+    exec_db(
+        """
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            qty REAL NOT NULL DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE,
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
 def ensure_schema():
     exec_db("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL, applied_at DATETIME)")
     if not query_db("SELECT 1 FROM schema_meta LIMIT 1", one=True):
@@ -3419,6 +3502,8 @@ def ensure_schema():
         _migration_11_analytics_aggregates,            # v11
         _migration_12_tokens_and_mail_imap,            # v12
         _migration_13_api_tokens_refactor,             # v13
+        _migration_14_tasks_time_tracking_subtasks,    # v14
+        _migration_15_documents_and_inventory,         # v15
     ]
 
     try:
@@ -7814,7 +7899,8 @@ def settings():
         ai_jobs = query_db("SELECT id,kind,status,created_at FROM ai_jobs WHERE org_id=? ORDER BY id DESC LIMIT 50", (org_id,))
         statuses = query_db("SELECT id,name FROM task_statuses WHERE org_id=? ORDER BY id", (org_id,))
         users = query_db("SELECT id, username, email, role, active, created_at FROM users WHERE org_id=? ORDER BY id", (org_id,))
-        inner = render_safe(SETTINGS_TMPL, channels=ch_list, webhooks=webhooks, scripts=scripts, ai_jobs=ai_jobs, task_statuses=statuses, users=users)
+        departments = query_db("SELECT id, name, slug, created_at FROM departments WHERE org_id=? ORDER BY id", (org_id,))
+        inner = render_safe(SETTINGS_TMPL, channels=ch_list, webhooks=webhooks, scripts=scripts, ai_jobs=ai_jobs, task_statuses=statuses, users=users, departments=departments)
         return render_safe(LAYOUT_TMPL, inner=inner)
     except Exception as e:
         app.logger.exception(f"Settings error: {e}")
@@ -8065,6 +8151,11 @@ def settings_user_add():
     email = (request.form.get("email") or "").strip()
     role = (request.form.get("role") or "agent").strip()
     pwd = (request.form.get("password") or "").strip()
+    dept_id = 0
+    try:
+        dept_id = int(request.form.get("department_id") or "0")
+    except Exception:
+        dept_id = 0
     ok, msg = password_policy_ok(pwd)
     if not ok or not username:
         flash(msg or "Логин/пароль некорректны", "error")
@@ -8072,10 +8163,30 @@ def settings_user_add():
     if query_db("SELECT 1 FROM users WHERE org_id=? AND username=?", (org_id, username), one=True):
         flash("Логин уже существует в организации", "error")
         return redirect(url_for("settings"))
-    exec_db(
+    uid = exec_db(
         "INSERT INTO users (org_id,username,email,password_hash,role,active) VALUES (?,?,?,?,?,1)",
         (org_id, username, email, generate_password_hash(pwd), role),
     )
+    if uid and dept_id:
+        # ensure department belongs to org
+        if query_db("SELECT 1 FROM departments WHERE id=? AND org_id=?", (dept_id, org_id), one=True):
+            exec_db(
+                "INSERT OR IGNORE INTO department_members (org_id, department_id, user_id, role) VALUES (?,?,?, 'member')",
+                (org_id, dept_id, uid),
+            )
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/department/add", methods=["POST"])
+@admin_required
+def settings_department_add():
+    verify_csrf()
+    org_id = current_org_id()
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        return redirect(url_for("settings"))
+    slug = slugify(name)
+    exec_db("INSERT INTO departments (org_id,name,slug) VALUES (?,?,?)", (org_id, name, slug))
     return redirect(url_for("settings"))
 
 
@@ -9123,6 +9234,8 @@ a{color:var(--accent);text-decoration:none} a:hover{opacity:.9}
 .card form label{display:block;margin:6px 0}
 .card form .input,.card form .select,.card form textarea{width:100%}
 .grid-filters .input,.grid-filters .select{width:100%}
+/* fixed-width inputs for specific modal forms */
+.form-fixed input.input, .form-fixed select.select, .form-fixed textarea.input { width: 320px; max-width: 100%; }
 
 .fab{position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#0b130f;border:none;font-size:24px;line-height:48px;text-align:center;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.35)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:1000}
@@ -9166,6 +9279,8 @@ LAYOUT_TMPL = """
           <a class="navitem {% if request.path.startswith('/inbox') or request.path=='/' %}active{% endif %}" href="{{ url_for('inbox') }}"><span class="icon">📨</span><span class="label">Входящие</span></a>
           <a class="navitem {% if request.path.startswith('/tasks') or request.path.startswith('/task/') %}active{% endif %}" href="{{ url_for('tasks_page') }}"><span class="icon">✅</span><span class="label">Задачи</span></a>
           <a class="navitem {% if request.path.startswith('/deals') %}active{% endif %}" href="{{ url_for('deals_page') }}"><span class="icon">📈</span><span class="label">Сделки</span></a>
+          <a class="navitem {% if request.path.startswith('/documents') or request.path.startswith('/document/') %}active{% endif %}" href="{{ url_for('documents_page') }}"><span class="icon">📄</span><span class="label">Документы</span></a>
+          <a class="navitem {% if request.path.startswith('/warehouse') %}active{% endif %}" href="{{ url_for('warehouse_page') }}"><span class="icon">📦</span><span class="label">Склад</span></a>
           <a class="navitem {% if request.path.startswith('/lookup') %}active{% endif %}" href="{{ url_for('lookup') }}"><span class="icon">🔎</span><span class="label">Поиск</span></a>
           <a class="navitem {% if request.path.startswith('/chat') %}active{% endif %}" href="{{ url_for('chat') }}"><span class="icon">💬</span><span class="label">Чаты</span></a>
           <a class="navitem {% if request.path.startswith('/clients') or request.path.startswith('/client/') %}active{% endif %}" href="{{ url_for('clients_list') }}"><span class="icon">🧑‍💼</span><span class="label">Клиенты</span></a>
@@ -10178,15 +10293,17 @@ TASKS_TMPL = """
   });
 </script>
 <style>
-  .fab{position:fixed;left:18px;bottom:18px;z-index:9999}
+  .fab{position:fixed;right:18px;bottom:18px;z-index:9999}
   .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
   .fab .plus:hover{filter:brightness(0.95)}
   .fab .plus:focus{outline:2px solid var(--border)}
+  /* fixed-width inputs in modals */
+  .form-fixed input.input, .form-fixed select.select, .form-fixed textarea.input { width: 320px; max-width: 100%; }
 </style>
 <div class="modal-backdrop" id="taskModal">
   <div class="modal">
     <h3>Новая задача</h3>
-    <form method="post" action="{{ url_for('tasks_page') }}" style="display:grid;gap:8px;max-width:820px;">
+    <form method="post" action="{{ url_for('tasks_page') }}" style="display:grid;gap:8px;max-width:820px;" class="form-fixed">
       <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
       <label>Заголовок <input class="input" name="title" required placeholder="Что нужно сделать?"></label>
       <label>Описание <textarea class="input" name="description" rows="3" placeholder="Краткое описание"></textarea></label>
@@ -10690,7 +10807,7 @@ DEALS_TMPL = """
 <div class="modal-backdrop" id="dealModal">
   <div class="modal">
     <h3 id="dealModalTitle">Новая сделка</h3>
-    <form style="display:grid;gap:8px;">
+    <form style="display:grid;gap:8px;" class="form-fixed">
       <label>Название <input class="input" id="dlTitle" required></label>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
         <label>Стадия <input class="input" id="dlStage" placeholder="new"></label>
@@ -10923,7 +11040,7 @@ DEALS_TMPL = """
   loadKanban();
 </script>
 <style>
-  .fab{position:fixed;left:18px;bottom:18px;z-index:9999}
+  .fab{position:fixed;right:18px;bottom:18px;z-index:9999}
   .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
   .fab .plus:hover{filter:brightness(0.95)}
   .fab .plus:focus{outline:2px solid var(--border)}
@@ -12181,6 +12298,12 @@ SETTINGS_TMPL = """
             {% endfor %}
           </select>
         </label>
+        <label>Отдел
+          <select class="select" name="department_id">
+            <option value="">—</option>
+            {% for d in departments %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+          </select>
+        </label>
         <label>Пароль <input class="input" name="password" type="password" required></label>
         <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="button" type="submit">Создать</button></div>
       </form>
@@ -12212,6 +12335,31 @@ SETTINGS_TMPL = """
         </div>
         <div id="tokOnce" class="help"></div>
       </div>
+    </details>
+  </div>
+</div>
+
+<div class="split" style="margin-top:10px;align-items:start;">
+  <!-- Отделы -->
+  <div class="card">
+    <h3>Отделы</h3>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Название</th><th>Slug</th><th>Создан</th></tr></thead>
+      <tbody>
+        {% for d in departments %}
+        <tr><td>#{{ d.id }}</td><td>{{ d.name }}</td><td class="help">{{ d.slug or '—' }}</td><td>{{ d.created_at }}</td></tr>
+        {% else %}
+        <tr><td colspan="4"><div class="help">Отделы не созданы</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <details style="margin-top:8px;">
+      <summary class="button ghost">Добавить отдел</summary>
+      <form method="post" action="{{ url_for('settings_department_add') }}" style="display:flex;gap:8px;align-items:end;margin-top:8px;flex-wrap:wrap;">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <label>Название <input class="input" name="name" placeholder="Например, Продажи" required></label>
+        <button class="button" type="submit">Создать</button>
+      </form>
     </details>
   </div>
 </div>
@@ -12545,6 +12693,252 @@ details>summary.button::-webkit-details-marker{display:none}
 """
 
 # --- Extra routes/helpers appended in this section ---
+
+# ===== Documents module =====
+DOCUMENTS_TMPL = """
+<h2 style=\"margin:0 0 8px 0;\">Документы</h2>
+
+<div class=\"split\" style=\"align-items:start;\">
+  <div class=\"card\">
+    <h3>Шаблоны</h3>
+    <table class=\"table\">
+      <thead><tr><th>ID</th><th>Тип</th><th>Название</th><th>Ключ</th><th>Создан</th></tr></thead>
+      <tbody>
+        {% for t in templates %}
+        <tr><td>#{{ t.id }}</td><td>{{ t.type }}</td><td>{{ t.name }}</td><td class=\"help\">{{ t.tkey or '—' }}</td><td>{{ t.created_at }}</td></tr>
+        {% else %}
+        <tr><td colspan=\"5\"><div class=\"help\">Нет шаблонов</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <details style=\"margin-top:8px;\">
+      <summary class=\"button ghost\">Добавить шаблон</summary>
+      <form method=\"post\" action=\"{{ url_for('documents_template_add') }}\" style=\"display:grid;gap:8px;max-width:820px;margin-top:8px;\">
+        <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
+        <div class=\"split\" style=\"grid-template-columns:1fr 1fr 1fr;gap:8px;\">
+          <label>Тип
+            <select class=\"select\" name=\"type\">
+              {% for t in ('contract','invoice','proposal') %}<option value=\"{{ t }}\">{{ t }}</option>{% endfor %}
+            </select>
+          </label>
+          <label>Название <input class=\"input\" name=\"name\" required></label>
+          <label>Ключ (необяз.) <input class=\"input\" name=\"tkey\" placeholder=\"offer-2025\"></label>
+        </div>
+        <label>Шаблон (HTML с переменными Jinja)
+          <textarea class=\"input\" name=\"body_template\" rows=\"10\" placeholder=\"<h1>Договор с {{ company.name }}</h1>\n<p>Организация: {{ org.name }}</p>\n<p>Дата: {{ now }}</p>\" required></textarea>
+        </label>
+        <div style=\"display:flex;gap:8px;justify-content:flex-end;\"><button class=\"button\" type=\"submit\">Сохранить</button></div>
+      </form>
+    </details>
+  </div>
+
+  <div class=\"card\">
+    <h3>Создать документ</h3>
+    <form method=\"post\" action=\"{{ url_for('documents_create') }}\" style=\"display:grid;gap:8px;max-width:620px;\">
+      <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
+      <label>Шаблон
+        <select class=\"select\" name=\"template_id\" required>
+          {% for t in templates %}<option value=\"{{ t.id }}\">[{{ t.type }}] {{ t.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Компания (ID)
+        <select class=\"select\" name=\"company_id\">
+          <option value=\"\">—</option>
+          {% for c in companies %}<option value=\"{{ c.id }}\">#{{ c.id }} · {{ c.name }}{% if c.inn %} · ИНН {{ c.inn }}{% endif %}</option>{% endfor %}
+        </select>
+      </label>
+      <div style=\"display:flex;gap:8px;justify-content:flex-end;\"><button class=\"button\" type=\"submit\">Создать</button></div>
+    </form>
+
+    <div class=\"help\" style=\"margin-top:8px;\">Последние документы:</div>
+    <table class=\"table\">
+      <thead><tr><th>ID</th><th>Тип</th><th>Заголовок</th><th>Компания</th><th>Создан</th><th></th></tr></thead>
+      <tbody>
+        {% for d in docs %}
+        <tr>
+          <td>#{{ d.id }}</td><td>{{ d.doc_type }}</td><td>{{ d.title }}</td><td>{{ d.company_name or '—' }}</td><td>{{ d.created_at }}</td>
+          <td><a class=\"iconbtn small\" href=\"{{ url_for('document_view', doc_id=d.id) }}\">Открыть</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan=\"6\"><div class=\"help\">Документов пока нет</div></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+DOCUMENT_VIEW_TMPL = """
+<h2>Документ #{{ d.id }} · {{ d.title }}</h2>
+<div class=\"card\">
+  <div class=\"help\">Тип: {{ d.doc_type }} · Создан: {{ d.created_at }}</div>
+  <div class=\"p-12\" style=\"background:var(--panel);border-radius:12px;border:1px solid var(--border);\">
+    {{ d.content_html|safe }}
+  </div>
+  <div style=\"display:flex;gap:8px;justify-content:flex-end;margin-top:8px;\">
+    <button class=\"button secondary\" onclick=\"window.print()\">Печать / PDF</button>
+  </div>
+  <div class=\"help\" style=\"margin-top:8px;\">В ближайших версиях появится вложение в письма и интеграции (Мои документы, 1С)</div>
+  </div>
+"""
+
+
+@app.route("/documents")
+@admin_required
+def documents_page():
+    org_id = current_org_id()
+    templates = query_db("SELECT id,name,type,tkey,created_at FROM documents_templates WHERE org_id=? ORDER BY id DESC", (org_id,))
+    docs = query_db(
+        """
+        SELECT d.id, d.doc_type, d.title, d.created_at, c.name AS company_name
+        FROM documents d
+        LEFT JOIN companies c ON c.id=d.company_id
+        WHERE d.org_id=?
+        ORDER BY d.id DESC LIMIT 100
+        """,
+        (org_id,),
+    )
+    companies = query_db("SELECT id,name,inn FROM companies WHERE org_id=? ORDER BY id DESC LIMIT 200", (org_id,))
+    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENTS_TMPL, templates=templates, docs=docs, companies=companies))
+
+
+@app.route("/documents/template/add", methods=["POST"])
+@admin_required
+def documents_template_add():
+    verify_csrf()
+    org_id = current_org_id()
+    typ = (request.form.get("type") or "").strip() or "proposal"
+    name = (request.form.get("name") or "").strip()
+    tkey = (request.form.get("tkey") or "").strip() or None
+    body = request.form.get("body_template") or ""
+    if not name or not body:
+        return redirect(url_for("documents_page"))
+    exec_db(
+        "INSERT INTO documents_templates (org_id,name,type,tkey,body_template) VALUES (?,?,?,?,?)",
+        (org_id, name, typ, tkey, body),
+    )
+    return redirect(url_for("documents_page"))
+
+
+@app.route("/documents/create", methods=["POST"])
+@admin_required
+def documents_create():
+    verify_csrf()
+    org_id = current_org_id()
+    try:
+        template_id = int(request.form.get("template_id") or "0")
+    except Exception:
+        template_id = 0
+    try:
+        company_id = int(request.form.get("company_id") or "0")
+    except Exception:
+        company_id = 0
+    tpl = query_db("SELECT * FROM documents_templates WHERE id=? AND org_id=?", (template_id, org_id), one=True)
+    if not tpl:
+        return redirect(url_for("documents_page"))
+    org = query_db("SELECT * FROM orgs WHERE id=?", (org_id,), one=True)
+    company = query_db("SELECT * FROM companies WHERE id=? AND org_id=?", (company_id, org_id), one=True) if company_id else None
+    user = get_current_user()
+    ctx = {
+        "org": dict(org or {}),
+        "company": dict(company or {}),
+        "user": dict(user or {}),
+        "now": datetime.utcnow().strftime("%Y-%m-%d"),
+    }
+    try:
+        content_html = render_template_string(str(tpl["body_template"] or ""), **ctx)
+    except Exception as e:
+        app.logger.error(f"Doc render failed: {e}")
+        content_html = f"<pre>Ошибка рендеринга шаблона: {e}</pre>"
+    title = f"{tpl['name']}" + (f" · {company['name']}" if company else "")
+    did = exec_db(
+        "INSERT INTO documents (org_id,template_id,doc_type,company_id,user_id,title,content_html) VALUES (?,?,?,?,?,?,?)",
+        (org_id, tpl["id"], tpl["type"], company_id if company else None, session.get("user_id"), title, content_html),
+    )
+    return redirect(url_for("document_view", doc_id=did))
+
+
+@app.route("/document/<int:doc_id>")
+@login_required
+def document_view(doc_id: int):
+    org_id = current_org_id()
+    d = query_db("SELECT * FROM documents WHERE id=? AND org_id=?", (doc_id, org_id), one=True)
+    if not d:
+        flash("Документ не найден", "error")
+        return redirect(url_for("documents_page"))
+    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENT_VIEW_TMPL, d=d))
+
+
+# ===== Warehouse (Inventory) module =====
+WAREHOUSE_TMPL = """
+<h2 style=\"margin:0 0 8px 0;\">Склад</h2>
+<div class=\"card\">
+  <div class=\"help\">Учет остатков по товарам. Для синхронизации с "Мой склад" добавим интеграцию позже.</div>
+  <table class=\"table\">
+    <thead><tr><th>ID</th><th>SKU</th><th>Название</th><th>Цена</th><th>Кол-во</th><th></th></tr></thead>
+    <tbody>
+      {% for p in products %}
+      <tr>
+        <td>#{{ p.id }}</td><td class=\"help\">{{ p.sku }}</td><td>{{ p.name }}</td>
+        <td>{{ p.price }} {{ p.currency }}</td>
+        <td>{{ p.qty|default(0) }}</td>
+        <td>
+          <form method=\"post\" action=\"{{ url_for('warehouse_stock_set') }}\" style=\"display:flex;gap:6px;align-items:center;\">
+            <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
+            <input type=\"hidden\" name=\"product_id\" value=\"{{ p.id }}\">
+            <input class=\"input\" name=\"qty\" placeholder=\"0\" value=\"{{ p.qty|default(0) }}\" style=\"max-width:120px;\">
+            <button class=\"iconbtn small\" type=\"submit\">Обновить</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan=\"6\"><div class=\"help\">Товары не заведены</div></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+"""
+
+
+@app.route("/warehouse")
+@admin_required
+def warehouse_page():
+    org_id = current_org_id()
+    rows = query_db(
+        """
+        SELECT p.id, p.sku, p.name, p.price, p.currency, COALESCE(i.qty,0) AS qty
+        FROM products p
+        LEFT JOIN inventory i ON i.product_id=p.id AND i.org_id=p.org_id
+        WHERE p.org_id=?
+        ORDER BY p.id DESC
+        LIMIT 500
+        """,
+        (org_id,),
+    )
+    return render_safe(LAYOUT_TMPL, inner=render_safe(WAREHOUSE_TMPL, products=rows))
+
+
+@app.route("/warehouse/stock/set", methods=["POST"])
+@admin_required
+def warehouse_stock_set():
+    verify_csrf()
+    org_id = current_org_id()
+    try:
+        product_id = int(request.form.get("product_id") or "0")
+        qty = float(request.form.get("qty") or "0")
+    except Exception:
+        product_id = 0
+        qty = 0.0
+    if not product_id:
+        return redirect(url_for("warehouse_page"))
+    # ensure product exists in this org
+    if not query_db("SELECT 1 FROM products WHERE id=? AND org_id=?", (product_id, org_id), one=True):
+        return redirect(url_for("warehouse_page"))
+    if query_db("SELECT 1 FROM inventory WHERE product_id=? AND org_id=?", (product_id, org_id), one=True):
+        exec_db("UPDATE inventory SET qty=?, updated_at=CURRENT_TIMESTAMP WHERE product_id=? AND org_id=?", (qty, product_id, org_id))
+    else:
+        exec_db("INSERT INTO inventory (org_id, product_id, qty) VALUES (?,?,?)", (org_id, product_id, qty))
+    return redirect(url_for("warehouse_page"))
 
 # Reports: tasks daily aggregates
 @app.route("/api/reports/tasks_daily")
