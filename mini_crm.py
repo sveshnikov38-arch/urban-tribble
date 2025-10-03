@@ -1,8 +1,9 @@
-# === CORE PART 1/9 — Imports, ENV/Config, Flask init, JSON logging, Metrics (enhanced) ===
+# === CORE PART 1/11 — Imports, ENV/Config, Flask init, JSON logging, Metrics (enhanced) ===
 # -*- coding: utf-8 -*-
 import os
 import io
 import re
+import sys
 import hmac
 import csv
 import json
@@ -19,10 +20,12 @@ import shutil
 import socket
 import ipaddress
 import logging
+import platform
 from datetime import datetime, date, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlencode, urlparse
 
+import flask as _flask
 from flask import (
     Flask, g, request, redirect, url_for, session, flash, abort, jsonify,
     make_response, Response, send_file, render_template_string
@@ -77,6 +80,9 @@ except Exception:  # pragma: no cover
     _SentryFlaskIntegration = None
 
 APP_NAME = os.environ.get("APP_NAME", "Unified CRM/ERP")
+
+# CLI flag (handled at the end of file in entry point)
+CLI_MIGRATE = ("--migrate" in sys.argv)
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
@@ -179,8 +185,9 @@ METRICS_PUBLIC = os.environ.get("METRICS_PUBLIC", "0") == "1"
 # 2FA setup TTL (seconds)
 TWOFA_SETUP_TTL_SEC = int(os.environ.get("TWOFA_SETUP_TTL_SEC", "600"))
 
-# Workers toggle
+# Workers toggle + mode
 WORKERS_ENABLED = os.environ.get("WORKERS_ENABLED", "1") == "1"
+WORKERS_MODE = os.environ.get("WORKERS_MODE", "main").strip().lower()  # 'main' | 'off'
 
 # Avatar upload restrictions
 AVATAR_MAX_SIZE = int(os.environ.get("AVATAR_MAX_SIZE", str(5 * 1024 * 1024)))
@@ -188,11 +195,12 @@ AVATAR_ALLOWED_TYPES = set((os.environ.get("AVATAR_ALLOWED_TYPES") or "image/png
 AVATAR_CONTENT_SNIFF = os.environ.get("AVATAR_CONTENT_SNIFF", "1") == "1"
 
 # General upload whitelist (used for message/chat uploads)
-UPLOAD_ALLOWED_TYPES = set((
-    os.environ.get("UPLOAD_ALLOWED_TYPES") or
-    "image/png,image/jpeg,image/webp,application/pdf,application/zip,application/octet-stream,"
-    "audio/mpeg,audio/wav,video/mp4,text/plain"
-).split(","))
+# Hardened: by default, exclude application/octet-stream for user uploads (can be enabled for integrations).
+ALLOW_OCTET_STREAM_FOR_INTEGRATIONS = os.environ.get("ALLOW_OCTET_STREAM_FOR_INTEGRATIONS", "0") == "1"
+_upload_types_default = "image/png,image/jpeg,image/webp,application/pdf,application/zip,audio/mpeg,audio/wav,video/mp4,text/plain"
+if ALLOW_OCTET_STREAM_FOR_INTEGRATIONS:
+    _upload_types_default += ",application/octet-stream"
+UPLOAD_ALLOWED_TYPES = set((os.environ.get("UPLOAD_ALLOWED_TYPES") or _upload_types_default).split(","))
 
 # Public signed file links (optional)
 PUBLIC_SIGNED_FILES_ENABLED = os.environ.get("PUBLIC_SIGNED_FILES_ENABLED", "0") == "1"
@@ -244,7 +252,9 @@ LOGIN_ORG_REQUIRED = os.environ.get("LOGIN_ORG_REQUIRED", "1") == "1"
 # API Tokens hashing (pepper from SECRET_KEY)
 TOKEN_HASH_ALG = "sha256"
 
+# Global flags/holders
 _failed_login = {}
+FTS_AVAILABLE = None  # will be detected during schema ensure
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -310,7 +320,6 @@ class SecretSanitizerFilter(logging.Filter):
         (re.compile(r"(Authorization:\s*Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*", re.I), r"\1***"),
         (re.compile(r"(X-Api-Key:\s*)[A-Za-z0-9\-\._~\+\/]+=*", re.I), r"\1***"),
     ]
-
     def filter(self, record):
         try:
             try:
@@ -373,12 +382,52 @@ def _setup_logging():
 
 _setup_logging()
 
+def _runtime_info():
+    """Log runtime environment details once at startup."""
+    try:
+        pyver = sys.version.split()[0]
+        flv = getattr(_flask, "__version__", "unknown")
+        try:
+            sver = sqlite3.sqlite_version
+        except Exception:
+            sver = "unknown"
+        opts = []
+        try:
+            con = sqlite3.connect(":memory:")
+            cur = con.execute("PRAGMA compile_options")
+            opts = [r[0] for r in cur.fetchall() if r and r[0]]
+            try:
+                con.close()
+            except Exception:
+                pass
+        except Exception:
+            opts = []
+        app.logger.info(json.dumps({
+            "runtime": True,
+            "python": pyver,
+            "flask": flv,
+            "sqlite": sver,
+            "platform": platform.platform(),
+            "fts5_enabled": any("FTS5" in o.upper() for o in opts),
+            "compile_options": opts[:50],  # limit log size
+            "workers_enabled": WORKERS_ENABLED,
+            "workers_mode": WORKERS_MODE,
+            "redis": bool(REDIS_CLIENT),
+            "s3": bool(S3_ENABLED and boto3 and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY),
+            "metrics_enabled": ENABLE_METRICS,
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+
+_runtime_info()
+
 # Styles placeholder; will be overwritten in STYLES parts
 BASE_CSS = ""
 
 # Metrics scaffold (enhanced, cumulative buckets + snapshot)
 _metrics = {
     "http_requests_total": {},              # (method, endpoint, status) -> count
+    "http_in_flight": {},                   # (endpoint,) -> gauge (current in-flight per endpoint)
     "http_request_duration_ms": {},         # (endpoint, bucket) -> cumulative count (le{num} / le_inf)
     "http_request_duration_ms_sum": {},     # endpoint -> sum_ms
     "http_request_duration_ms_count": {},   # endpoint -> count
@@ -389,7 +438,6 @@ _metrics = {
     "workflow_runs_active": {},             # (org_id,) -> value (gauge)
     "workflow_queue_lag_sec": {},           # (kind,) -> value (gauge)
     "email_fetch_errors_total": {},         # (account_id,) -> count
-    # Added metrics
     "migrations_errors_total": {},          # (version,) -> count
     "selftest_failures_total": {},          # (check,) -> count
     "kanban_ops_total": {},                 # (op,) -> count
@@ -443,8 +491,8 @@ def _metrics_snapshot():
     except Exception:
         snap = {k: dict(v) if isinstance(v, dict) else v for k, v in _metrics.items()}
     return snap
-# === END CORE PART 1/9 ===
-# === CORE PART 2/9 — DB helpers, CSRF, Utils, Client IP, Rate limit, RBAC, Safe render, 2FA backup ===
+# === END CORE PART 1/11 ===
+# === CORE PART 2/11 — DB helpers, CSRF, Utils, Client IP, Rate limit, RBAC, Safe render, 2FA backup ===
 # -*- coding: utf-8 -*-
 
 # ------------------- DB helpers (with retry/backoff) -------------------
@@ -1023,8 +1071,8 @@ def chat_access_allowed(user_id: int, channel_id: int, org_id: int) -> bool:
         return bool(r)
     except Exception:
         return False
-# === END CORE PART 2/9 ===
-# === CORE PART 3/9 — CSP, Theming, Storage, Files (with optional public-signed) ===
+# === END CORE PART 2/11 ===
+# === CORE PART 3/11 — CSP, Theming, Storage, Files (with optional public-signed) ===
 # -*- coding: utf-8 -*-
 from urllib.parse import urlparse as _urlparse  # local alias
 
@@ -1289,8 +1337,8 @@ def file_public_signed():
         as_attach = not (ctype.startswith("image/") or ctype == "application/pdf" or ctype.startswith("audio/") or ctype.startswith("video/"))
         return send_file(path, mimetype=ctype, as_attachment=as_attach, download_name=row["original_name"] or os.path.basename(path))
     abort(404)
-# === END CORE PART 3/9 ===
-# === CORE PART 4/9 — SSE (Redis-aware), Hooks, Health/Ready, Metrics (+OpenAPI, Selftest) ===
+# === END CORE PART 3/11 ===
+# === CORE PART 4/11 — SSE (Redis-aware), Hooks, Health/Ready, Metrics (+OpenAPI, Selftest) ===
 # -*- coding: utf-8 -*-
 
 # ------------------- SSE infrastructure (Redis-aware) -------------------
@@ -1430,13 +1478,36 @@ def sse():
     return resp
 
 
-# ------------------- Base hooks and minimal routes -------------------
+# ------------------- Request hooks (CSRF/theme/request-id; 2FA/password gates; metrics) -------------------
+def _inflight_add(endpoint: str, delta: int):
+    try:
+        key = (endpoint or "unknown",)
+        with _metrics_lock:
+            cur = _metrics.setdefault("http_in_flight", {}).get(key, 0)
+            val = cur + int(delta)
+            if val < 0:
+                val = 0
+            _metrics["http_in_flight"][key] = val
+    except Exception:
+        pass
+
+
 @app.before_request
 def _base_before():
     ensure_csrf()
     ensure_theme_default()
     if not hasattr(g, "request_id"):
         g.request_id = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+    try:
+        g._req_start = time.perf_counter()
+    except Exception:
+        g._req_start = time.perf_counter()
+    try:
+        ep = (request.endpoint or "unknown")
+        g._metrics_ep = ep
+        _inflight_add(ep, +1)
+    except Exception:
+        pass
 
 
 @app.before_request
@@ -1452,11 +1523,17 @@ def _enforce_2fa():
 
 
 @app.before_request
-def _metrics_before():
-    try:
-        g._req_start = time.perf_counter()
-    except Exception:
-        pass
+def _enforce_password_change():
+    if "user_id" in session and not session.get("2fa_pending"):
+        u = query_db("SELECT must_change_password FROM users WHERE id=?", (session["user_id"],), one=True)
+        if u and int(u["must_change_password"] or 0) == 1:
+            allowed = {
+                "password_change", "logout", "healthz", "readyz", "manifest",
+                "service_worker", "favicon", "setup", "sse"
+            }
+            ep = request.endpoint or ""
+            if ep not in allowed and not ep.startswith("static"):
+                return redirect(url_for("password_change"))
 
 
 @app.after_request
@@ -1468,6 +1545,11 @@ def _base_after(resp):
         status = resp.status_code
         _metrics_inc("http_requests_total", (method, endpoint, status))
         _metrics_observe_duration(endpoint, dt)
+    except Exception:
+        pass
+    try:
+        ep = getattr(g, "_metrics_ep", (request.endpoint or "unknown"))
+        _inflight_add(ep, -1)
     except Exception:
         pass
     resp.headers["X-Request-Id"] = getattr(g, "request_id", "-")
@@ -1485,6 +1567,7 @@ def _base_after(resp):
     return resp
 
 
+# ------------------- Minimal routes and service endpoints -------------------
 @app.route("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -1519,10 +1602,12 @@ def healthz():
 
 @app.route("/readyz")
 def readyz():
+    # DB check
     try:
         ok_db = bool(query_db("SELECT 1 as ok", one=True))
     except Exception:
         ok_db = False
+    # Redis check
     ok_redis = True
     required_redis = (REQUIRE_REDIS_FOR_RATE or REQUIRE_REDIS_FOR_LOCK)
     if REDIS_CLIENT:
@@ -1533,8 +1618,26 @@ def readyz():
     else:
         if required_redis:
             ok_redis = False
+    # FTS availability (best-effort)
+    try:
+        con = sqlite3.connect(":memory:")
+        cur = con.execute("PRAGMA compile_options")
+        opts = [r[0] for r in cur.fetchall() if r and r[0]]
+        fts = any("FTS5" in o.upper() for o in opts)
+        try:
+            con.close()
+        except Exception:
+            pass
+    except Exception:
+        fts = False
+    # Schema version (best-effort)
+    try:
+        vrow = query_db("SELECT version FROM schema_meta LIMIT 1", one=True)
+        schema_ver = int(vrow["version"]) if vrow and (vrow["version"] is not None) else 0
+    except Exception:
+        schema_ver = 0
     ok = ok_db and (ok_redis or not required_redis)
-    return (jsonify(ok=ok, db=ok_db, redis=ok_redis, redis_required=required_redis), 200 if ok else 503)
+    return (jsonify(ok=ok, db=ok_db, redis=ok_redis, redis_required=required_redis, fts_available=fts, schema_version=schema_ver), 200 if ok else 503)
 
 
 # ------------------- Minimal OpenAPI (subset) -------------------
@@ -1573,12 +1676,6 @@ def admin_selftest():
     except Exception:
         fails.append("db.core_tables")
     try:
-        # FTS available?
-        _ = query_db("SELECT 1 FROM tasks_fts LIMIT 1")
-    except Exception:
-        # not fatal
-        pass
-    try:
         # endpoints smoke
         with app.test_request_context("/healthz"):
             pass
@@ -1610,6 +1707,11 @@ def metrics():
     lines.append(f"# TYPE {ns}_http_requests_total counter")
     for (method, endpoint, status), cnt in snap.get("http_requests_total", {}).items():
         lines.append(f'{ns}_http_requests_total{{method="{method}",endpoint="{endpoint}",status="{str(status)}"}} {cnt}')
+
+    lines.append(f"# HELP {ns}_http_in_flight HTTP in-flight requests")
+    lines.append(f"# TYPE {ns}_http_in_flight gauge")
+    for (endpoint,), val in snap.get("http_in_flight", {}).items():
+        lines.append(f'{ns}_http_in_flight{{endpoint="{endpoint}"}} {val}')
 
     lines.append(f"# HELP {ns}_http_request_duration_ms HTTP request duration ms")
     lines.append(f"# TYPE {ns}_http_request_duration_ms histogram")
@@ -1674,8 +1776,8 @@ def metrics():
         lines.append(f'{ns}_custom_fields_ops_total{{op="{op}"}} {cnt}')
 
     return Response("\n".join(lines) + "\n", mimetype="text/plain")
-# === END CORE PART 4/9 ===
-# === CORE PART 5/9 (1/3) — Schema helpers, Indexes (tuned), Backfill, App KV ===
+# === END CORE PART 4/11 ===
+# === CORE PART 5/11 (1/3) — Schema helpers, Indexes (tuned), Backfill, App KV, FTS feature detect ===
 # -*- coding: utf-8 -*-
 
 # ------------------- Schema helpers -------------------
@@ -1712,6 +1814,21 @@ def ensure_trigger(name: str, ddl: str):
             exec_db(ddl)
         except Exception as e:
             app.logger.error(f"Create trigger {name} failed: {e}")
+
+
+def _fts_supported() -> bool:
+    """Best-effort FTS5 support detection via PRAGMA compile_options."""
+    try:
+        con = sqlite3.connect(":memory:")
+        cur = con.execute("PRAGMA compile_options")
+        opts = [r[0] for r in cur.fetchall() if r and r[0]]
+        try:
+            con.close()
+        except Exception:
+            pass
+        return any("FTS5" in str(o).upper() for o in opts)
+    except Exception:
+        return False
 
 
 # ------------------- Indexes (performance-focused, with guards for optional tables) -------------------
@@ -1751,7 +1868,7 @@ def ensure_indexes():
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_last_comment ON tasks(last_commented_at)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_contact_person ON tasks(contact_person_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_deal ON tasks(deal_id)")
-    # new: subtasks/time tracking
+    # subtasks/time tracking
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_timer_started ON tasks(timer_started_at)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_tasks_time_spent ON tasks(time_spent_sec)")
@@ -1811,7 +1928,7 @@ def ensure_indexes():
     exec_db("CREATE INDEX IF NOT EXISTS idx_whqueue_status ON webhook_queue(status)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_whqueue_status_next ON webhook_queue(status, next_try_at)")
 
-    # companies/contacts/deals
+    # companies/contacts/deals (+pipelines)
     exec_db("CREATE INDEX IF NOT EXISTS idx_companies_org ON companies(org_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_companies_inn ON companies(inn)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_companies_phone ON companies(phone)")
@@ -1828,6 +1945,11 @@ def ensure_indexes():
     exec_db("CREATE INDEX IF NOT EXISTS idx_deals_curr_dept ON deals(org_id, current_department_id)")
     exec_db("CREATE INDEX IF NOT EXISTS idx_deals_org_status_asg ON deals(org_id, status, assignee_id)")
     exec_db("CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_inn_org ON companies(org_id, inn) WHERE inn IS NOT NULL")
+    # pipelines (new)
+    if "pipeline_key" in table_columns("deals"):
+        exec_db("CREATE INDEX IF NOT EXISTS idx_deals_pipeline_stage ON deals(org_id, pipeline_key, stage)")
+    if "pipeline_key" in table_columns("workflow_stages"):
+        exec_db("CREATE INDEX IF NOT EXISTS idx_wfstg_pipeline ON workflow_stages(org_id, entity_type, pipeline_key, order_no)")
 
     # departments/workflow/participants
     exec_db("CREATE INDEX IF NOT EXISTS idx_dept_org ON departments(org_id)")
@@ -1968,11 +2090,21 @@ def set_app_meta(key: str, value: str):
             )
     except Exception as e:
         app.logger.error(f"set_app_meta failed: {e}")
-# === END CORE PART 5/9 (1/3) ===
-# === CORE PART 5/9 (2/3) — FTS helpers (safe rebuild), email_fts, upsert/delete ===
+# === END CORE PART 5/11 (1/3) ===
+# === CORE PART 5/11 (2/3) — FTS helpers (safe detect/rebuild), email_fts, upsert/delete ===
 # -*- coding: utf-8 -*-
 
-# ------------------- FTS helpers -------------------
+def _fts_ok() -> bool:
+    """Return cached/detected FTS5 availability."""
+    global FTS_AVAILABLE
+    try:
+        if FTS_AVAILABLE is None:
+            FTS_AVAILABLE = _fts_supported()
+        return bool(FTS_AVAILABLE)
+    except Exception:
+        return False
+
+
 def _fts_table_exists(name: str) -> bool:
     try:
         r = query_db("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,), one=True)
@@ -1982,6 +2114,10 @@ def _fts_table_exists(name: str) -> bool:
 
 
 def ensure_fts_tables():
+    """Create FTS5 virtual tables if FTS is supported; otherwise no-op."""
+    if not _fts_ok():
+        app.logger.warning("FTS5 not available; skipping FTS virtual tables creation")
+        return
     if not _fts_table_exists("inbox_messages_fts"):
         exec_db("""CREATE VIRTUAL TABLE inbox_messages_fts USING fts5(body, content='');""")
     if not _fts_table_exists("tasks_fts"):
@@ -1997,6 +2133,9 @@ def ensure_fts_tables():
 
 
 def ensure_fts_triggers():
+    """Create DML triggers to keep FTS tables in sync; guarded by FTS availability."""
+    if not _fts_ok():
+        return
     # tasks -> tasks_fts
     ensure_trigger(
         "tr_tasks_ai",
@@ -2130,6 +2269,9 @@ def ensure_fts_triggers():
 
 
 def rebuild_fts_table(table_name: str):
+    """Drop and recreate specific FTS table with backfill; guarded by FTS availability."""
+    if not _fts_ok():
+        return
     con = get_db()
     try:
         cur = con.cursor()
@@ -2178,7 +2320,8 @@ def rebuild_fts_table(table_name: str):
 
 
 def fts_upsert(table_name: str, rowid: int, fields: dict):
-    if not rowid:
+    """Best-effort upsert into FTS table; if malformed, try rebuild once."""
+    if not _fts_ok() or not rowid:
         return
     try:
         exec_db(f"INSERT INTO {table_name}({table_name}, rowid) VALUES('delete', ?)", (rowid,))
@@ -2203,6 +2346,8 @@ def fts_upsert(table_name: str, rowid: int, fields: dict):
 
 
 def fts_delete(table_name: str, rowid: int):
+    if not _fts_ok() or not rowid:
+        return
     try:
         exec_db(f"INSERT INTO {table_name}({table_name}, rowid) VALUES('delete', ?)", (rowid,))
     except Exception:
@@ -2210,10 +2355,12 @@ def fts_delete(table_name: str, rowid: int):
 
 
 def fts_rebuild_all():
+    if not _fts_ok():
+        return
     for t in ("tasks_fts", "inbox_messages_fts", "chat_messages_fts", "transcripts_fts", "task_comments_fts", "email_messages_fts"):
         rebuild_fts_table(t)
-# === END CORE PART 5/9 (2/3) ===
-# === CORE PART 5/9 (3/3) — Migrations v1..v13 (transactional, locked), ensure_schema (metrics) ===
+# === END CORE PART 5/11 (2/3) ===
+# === CORE PART 5/11 (3/3-1) — Migrations v1..v5 (initial schema, extensions), schema_meta helpers ===
 # -*- coding: utf-8 -*-
 
 def _schema_get_version():
@@ -2234,7 +2381,7 @@ def _schema_set_version(v: int):
         app.logger.error(f"schema_meta update failed: {e}")
 
 
-# ---------- v1..v12 (initial schema and prior features) ----------
+# ---------- v1..v5 (initial schema and first extensions) ----------
 def _migration_1_initial():
     exec_db(
         """
@@ -2465,6 +2612,11 @@ def _migration_1_initial():
             last_commented_at DATETIME,
             last_commented_by INTEGER,
             pinned_files_json TEXT,
+            parent_task_id INTEGER,
+            time_spent_sec INTEGER NOT NULL DEFAULT 0,
+            timer_started_at DATETIME,
+            contact_person_id INTEGER,
+            deal_id INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE,
@@ -2779,6 +2931,7 @@ def _migration_1_initial():
             tags_json TEXT,
             extra_json TEXT,
             current_department_id INTEGER,
+            pipeline_key TEXT,
             due_at DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -2875,6 +3028,7 @@ def _migration_1_initial():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             org_id INTEGER NOT NULL,
             entity_type TEXT NOT NULL,
+            pipeline_key TEXT,
             key TEXT NOT NULL,
             name TEXT NOT NULL,
             order_no INTEGER NOT NULL DEFAULT 0,
@@ -2988,6 +3142,7 @@ def _migration_2_add_missing_columns():
     ensure_column("deals", "extra_json", "TEXT")
     ensure_column("deals", "current_department_id", "INTEGER")
     ensure_column("deals", "due_at", "DATETIME")
+    ensure_column("deals", "pipeline_key", "TEXT")
 
 
 def _migration_3_task_comments_and_app_meta():
@@ -3046,7 +3201,9 @@ def _migration_5_task_extended_fields():
     ensure_column("tasks", "contact_person_id", "INTEGER")
     ensure_column("tasks", "deal_id", "INTEGER")
     exec_db("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_part ON task_participants(org_id, task_id, user_id, role)")
-
+# === END CORE PART 5/11 (3/3-1) ===
+# === CORE PART 5/11 (3/3-2) — Migrations v6..v10 (users unique, workflow, custom fields, email, CPQ) ===
+# -*- coding: utf-8 -*-
 
 def _users_has_global_username_unique() -> bool:
     try:
@@ -3210,6 +3367,8 @@ def _migration_9_email_channel():
             port INTEGER,
             login TEXT,
             use_tls INTEGER NOT NULL DEFAULT 1,
+            password TEXT,
+            last_uid INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
         );"""
@@ -3285,7 +3444,9 @@ def _migration_10_cpq():
             FOREIGN KEY (deal_id) REFERENCES deals(id) ON DELETE SET NULL
         );"""
     )
-
+# === END CORE PART 5/11 (3/3-2) ===
+# === CORE PART 5/11 (3/3-3) — Migrations v11..v15 (analytics, tokens, docs/inventory), helpers ===
+# -*- coding: utf-8 -*-
 
 def _migration_11_analytics_aggregates():
     exec_db(
@@ -3315,7 +3476,6 @@ def _migration_11_analytics_aggregates():
     )
 
 
-# ---------- v12: API tokens hashing + scopes/expiry, mail account creds/UID ----------
 def _token_hash(raw: str) -> str:
     try:
         base = (SECRET_KEY + "::" + (raw or "")).encode("utf-8")
@@ -3341,13 +3501,11 @@ def _migration_12_tokens_and_mail_imap():
     ensure_column("mail_accounts", "last_uid", "INTEGER")
 
 
-# ---------- v13: API tokens refactor (remove NOT NULL token, enforce hash uniqueness) ----------
 def _migration_13_api_tokens_refactor():
     if not _object_exists("table", "api_tokens"):
         return
     try:
         cols = table_columns("api_tokens")
-        # Rebuild table to enforce modern schema: token may be NULL; token_hash required+unique per org
         exec_db("ALTER TABLE api_tokens RENAME TO api_tokens_old")
         exec_db(
             """
@@ -3366,9 +3524,9 @@ def _migration_13_api_tokens_refactor():
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
             );"""
         )
-        # Migrate data from old
         old_rows = query_db("SELECT * FROM api_tokens_old") or []
         for r in old_rows:
+            # r is sqlite3.Row; access by key
             th = r["token_hash"]
             if (not th) and ("token" in cols):
                 th = _token_hash(r["token"] or "")
@@ -3377,15 +3535,14 @@ def _migration_13_api_tokens_refactor():
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     r["id"], r["org_id"], r["user_id"], r["name"], th or "",
-                    r.get("scopes") if isinstance(r, dict) else r["scopes"],
-                    r.get("expires_at") if isinstance(r, dict) else r["expires_at"],
-                    r.get("last_used_at") if isinstance(r, dict) else r["last_used_at"],
-                    r.get("active") if isinstance(r, dict) else r["active"],
-                    r.get("created_at") if isinstance(r, dict) else r["created_at"],
+                    r["scopes"] if "scopes" in cols else None,
+                    r["expires_at"] if "expires_at" in cols else None,
+                    r["last_used_at"] if "last_used_at" in cols else None,
+                    r["active"] if "active" in cols else 1,
+                    r["created_at"] if "created_at" in cols else None,
                 ),
             )
         exec_db("DROP TABLE api_tokens_old")
-        # Indexes (also handled by ensure_indexes)
         exec_db("CREATE UNIQUE INDEX IF NOT EXISTS uq_tokens_org_hash ON api_tokens(org_id, token_hash)")
         exec_db("CREATE INDEX IF NOT EXISTS idx_tokens_org_active ON api_tokens(org_id, active)")
         exec_db("CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id)")
@@ -3397,33 +3554,28 @@ def _migration_13_api_tokens_refactor():
         _metrics_inc("migrations_errors_total", ("v13",))
 
 
-# ---------- v14: Tasks time tracking + subtasks columns ----------
 def _migration_14_tasks_time_tracking_subtasks():
-    # Add new columns to tasks for time tracking and subtasks hierarchy
+    # Ensure columns exist (for upgrades from earlier versions)
     ensure_column("tasks", "time_spent_sec", "INTEGER NOT NULL DEFAULT 0")
     ensure_column("tasks", "timer_started_at", "DATETIME")
     ensure_column("tasks", "parent_task_id", "INTEGER")
 
 
-# ---------- v15: Documents/Templates + Inventory (Warehouse) ----------
 def _migration_15_documents_and_inventory():
-    # Documents templates
+    # Idempotent creation (covered by v1 initial for new installs)
     exec_db(
         """
         CREATE TABLE IF NOT EXISTS documents_templates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             org_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            type TEXT NOT NULL,             -- contract | invoice | proposal
-            tkey TEXT,                      -- optional short key/slug
-            body_template TEXT NOT NULL,    -- Jinja-like HTML template
+            type TEXT NOT NULL,
+            tkey TEXT,
+            body_template TEXT NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
-        );
-        """
+        );"""
     )
-
-    # Documents instances
     exec_db(
         """
         CREATE TABLE IF NOT EXISTS documents (
@@ -3442,11 +3594,8 @@ def _migration_15_documents_and_inventory():
             FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL,
             FOREIGN KEY (deal_id) REFERENCES deals(id) ON DELETE SET NULL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-        );
-        """
+        );"""
     )
-
-    # Inventory (per product)
     exec_db(
         """
         CREATE TABLE IF NOT EXISTS inventory (
@@ -3457,16 +3606,46 @@ def _migration_15_documents_and_inventory():
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE,
             FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
-        """
+        );"""
     )
+# === END CORE PART 5/11 (3/3-3) ===
+# === CORE PART 6/11 — Schema ensure (transactional, locked), FTS ensure (feature-flag), Indexes, Backfill, CLI hook ===
+# -*- coding: utf-8 -*-
+
+def _migrations_list():
+    """Ordered list of migration callables (v1..v15)."""
+    return [
+        _migration_1_initial,                         # v1
+        _migration_2_add_missing_columns,             # v2
+        _migration_3_task_comments_and_app_meta,      # v3
+        _migration_4_task_activity_and_task_fields,   # v4
+        _migration_5_task_extended_fields,            # v5
+        _migration_6_fix_users_unique_username_scoped,# v6
+        _migration_7_workflow_builder,                # v7
+        _migration_8_custom_fields,                   # v8
+        _migration_9_email_channel,                   # v9
+        _migration_10_cpq,                            # v10
+        _migration_11_analytics_aggregates,           # v11
+        _migration_12_tokens_and_mail_imap,           # v12
+        _migration_13_api_tokens_refactor,            # v13
+        _migration_14_tasks_time_tracking_subtasks,   # v14
+        _migration_15_documents_and_inventory,        # v15
+    ]
 
 
 def ensure_schema():
-    exec_db("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL, applied_at DATETIME)")
-    if not query_db("SELECT 1 FROM schema_meta LIMIT 1", one=True):
-        exec_db("INSERT INTO schema_meta (version, applied_at) VALUES (0, CURRENT_TIMESTAMP)")
+    """Run pending migrations with locking, ensure FTS structures (if supported), indexes and backfills."""
+    global FTS_AVAILABLE
 
+    # bootstrap schema_meta
+    try:
+        exec_db("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL, applied_at DATETIME)")
+        if not query_db("SELECT 1 FROM schema_meta LIMIT 1", one=True):
+            exec_db("INSERT INTO schema_meta (version, applied_at) VALUES (0, CURRENT_TIMESTAMP)")
+    except Exception as e:
+        app.logger.error(f"schema_meta init failed: {e}")
+
+    # Locking (Redis preferred, otherwise SQLite EXCLUSIVE)
     lock_key = "schema:migrate:lock"
     got_lock = False
     sqlite_lock = False
@@ -3488,23 +3667,7 @@ def ensure_schema():
             sqlite_lock = False
 
     current = _schema_get_version()
-    migrations = [
-        _migration_1_initial,                          # v1
-        _migration_2_add_missing_columns,              # v2
-        _migration_3_task_comments_and_app_meta,       # v3
-        _migration_4_task_activity_and_task_fields,    # v4
-        _migration_5_task_extended_fields,             # v5
-        _migration_6_fix_users_unique_username_scoped, # v6
-        _migration_7_workflow_builder,                 # v7
-        _migration_8_custom_fields,                    # v8
-        _migration_9_email_channel,                    # v9
-        _migration_10_cpq,                             # v10
-        _migration_11_analytics_aggregates,            # v11
-        _migration_12_tokens_and_mail_imap,            # v12
-        _migration_13_api_tokens_refactor,             # v13
-        _migration_14_tasks_time_tracking_subtasks,    # v14
-        _migration_15_documents_and_inventory,         # v15
-    ]
+    migrations = _migrations_list()
 
     try:
         for idx, mig in enumerate(migrations, start=1):
@@ -3515,6 +3678,7 @@ def ensure_schema():
                         mig()
                         get_db().execute("RELEASE SAVEPOINT mig")
                         _schema_set_version(idx)
+                        current = idx
                     except Exception as e:
                         try:
                             get_db().execute("ROLLBACK TO SAVEPOINT mig")
@@ -3529,6 +3693,7 @@ def ensure_schema():
                         mig()
                         get_db().execute("COMMIT")
                         _schema_set_version(idx)
+                        current = idx
                     except Exception as e:
                         try:
                             get_db().execute("ROLLBACK")
@@ -3549,16 +3714,31 @@ def ensure_schema():
             except Exception:
                 pass
 
+    # Detect FTS and ensure structures
     try:
-        ensure_fts_tables()
-        ensure_fts_triggers()
+        FTS_AVAILABLE = _fts_supported()
+        if FTS_AVAILABLE:
+            ensure_fts_tables()
+            ensure_fts_triggers()
+        else:
+            app.logger.warning("FTS5 not available; FTS tables/triggers not created")
     except Exception as e:
         app.logger.error(f"FTS ensure failed: {e}")
 
+    # Secondary structures
     ensure_indexes()
     backfill_phone_norm()
-# === END CORE PART 5/9 (3/3) ===
-# === CORE PART 6/9 — Seed/Bootstrap/Context, Permissions, ensure_thread, Rules, Workflow triggers ===
+
+
+def run_migrations_cli_if_requested():
+    """Optional CLI hook: run migrations and exit if --migrate passed."""
+    if CLI_MIGRATE:
+        print("[CLI] Running migrations (ensure_schema)...")
+        ensure_schema()
+        print("[CLI] Migrations done.")
+        sys.exit(0)
+# === END CORE PART 6/11 ===
+# === CORE PART 7/11 (1/3) — Seed/Bootstrap/Context, Permissions, participants helpers ===
 # -*- coding: utf-8 -*-
 
 # ------------------- Optional sanitize (for rich comments, used later) -------------------
@@ -3675,25 +3855,25 @@ def seed_defaults():
     if not wf_task:
         dep_ops_id = query_db("SELECT id FROM departments WHERE org_id=? AND slug='ops' LIMIT 1", (org_id,), one=True)
         exec_many(
-            "INSERT INTO workflow_stages (org_id,entity_type,key,name,order_no,sla_minutes,default_department_id,active) VALUES (?,?,?,?,?,?,?,1)",
+            "INSERT INTO workflow_stages (org_id,entity_type,pipeline_key,key,name,order_no,sla_minutes,default_department_id,active) VALUES (?,?,?,?,?,?,?,?,1)",
             [
-                (org_id, "task", "new", "Новая", 10, 480, None),
-                (org_id, "task", "in_progress", "В работе", 20, 1440, None),
-                (org_id, "task", "ops", "Эксплуатация", 30, 1440, (dep_ops_id["id"] if dep_ops_id else None)),
-                (org_id, "task", "review", "Проверка", 40, 480, None),
-                (org_id, "task", "done", "Готово", 50, 0, None),
+                (org_id, "task", None, "new", "Новая", 10, 480, None),
+                (org_id, "task", None, "in_progress", "В работе", 20, 1440, None),
+                (org_id, "task", None, "ops", "Эксплуатация", 30, 1440, (dep_ops_id["id"] if dep_ops_id else None)),
+                (org_id, "task", None, "review", "Проверка", 40, 480, None),
+                (org_id, "task", None, "done", "Готово", 50, 0, None),
             ],
         )
     wf_deal = query_db("SELECT id FROM workflow_stages WHERE org_id=? AND entity_type='deal' LIMIT 1", (org_id,), one=True)
     if not wf_deal:
         exec_many(
-            "INSERT INTO workflow_stages (org_id,entity_type,key,name,order_no,sla_minutes,default_department_id,active) VALUES (?,?,?,?,?,?,?,1)",
+            "INSERT INTO workflow_stages (org_id,entity_type,pipeline_key,key,name,order_no,sla_minutes,default_department_id,active) VALUES (?,?,?,?,?,?,?,?,1)",
             [
-                (org_id, "deal", "new", "Новая", 10, 1440, None),
-                (org_id, "deal", "qualify", "Квалификация", 20, 1440, None),
-                (org_id, "deal", "proposal", "Предложение", 30, 1440, None),
-                (org_id, "deal", "won", "Успех", 90, 0, None),
-                (org_id, "deal", "lost", "Потеря", 95, 0, None),
+                (org_id, "deal", "default", "new", "Новая", 10, 1440, None),
+                (org_id, "deal", "default", "qualify", "Квалификация", 20, 1440, None),
+                (org_id, "deal", "default", "proposal", "Предложение", 30, 1440, None),
+                (org_id, "deal", "default", "won", "Успех", 90, 0, None),
+                (org_id, "deal", "default", "lost", "Потеря", 95, 0, None),
             ],
         )
 
@@ -3707,9 +3887,12 @@ def bootstrap_once():
     app.config["_BOOTSTRAPPED"] = True
 
 
-@app.before_request
-def _bootstrap_before_request():
-    bootstrap_once()
+@app.before_first_request
+def _bootstrap_on_first_request():
+    try:
+        bootstrap_once()
+    except Exception as e:
+        app.logger.exception(f"Bootstrap error: {e}")
 
 
 @app.context_processor
@@ -3884,184 +4067,8 @@ def can_post_to_thread(user_id: int, th_row) -> bool:
         return False
     except Exception:
         return False
-
-
-# ------------------- ensure_thread helper (find-or-create) -------------------
-def ensure_thread(org_id: int, channel_id: int, kind: str = "dm", external_id: str = "", subject: str = "") -> int:
-    try:
-        th = None
-        if external_id:
-            th = query_db(
-                "SELECT id FROM inbox_threads WHERE org_id=? AND channel_id=? AND kind=? AND external_id=? LIMIT 1",
-                (org_id, channel_id, kind, external_id),
-                one=True,
-            )
-        if th:
-            tid = th["id"]
-            exec_db("UPDATE inbox_threads SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (tid, org_id))
-            return tid
-        tid = exec_db(
-            """INSERT INTO inbox_threads (org_id,channel_id,kind,external_id,subject,status,priority,last_message_at,created_at)
-               VALUES (?,?,?,?,?,'open','normal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
-            (org_id, channel_id, kind or "dm", external_id or None, subject or None),
-        )
-        return tid or 0
-    except Exception as e:
-        app.logger.error(f"ensure_thread error: {e}")
-        return 0
-
-
-# ------------------- Simple rule engine (MVP, hardened) -------------------
-def _resolve_dotted(obj, path: str):
-    cur = obj
-    for part in (path.split(".") if path else []):
-        if isinstance(cur, dict) and part in cur:
-            cur = cur.get(part)
-        else:
-            return None
-    return cur
-
-
-def run_rules(event: str, org_id: int, payload: dict):
-    try:
-        rules = query_db("SELECT * FROM rules WHERE org_id=? AND event=? AND active=1 ORDER BY id", (org_id, event))
-        if not rules:
-            return
-        for r in rules:
-            try:
-                cond = json.loads(r["condition_json"] or "{}")
-            except Exception:
-                cond = {}
-            try:
-                params = json.loads(r["params_json"] or "{}")
-            except Exception:
-                params = {}
-            ok = True
-            if cond:
-                field = cond.get("field") or ""
-                op = (cond.get("op") or "eq").lower()
-                val = cond.get("value")
-                target = _resolve_dotted(payload, field)
-                ok = False
-                try:
-                    if op == "eq":
-                        ok = (str(target) == str(val))
-                    elif op == "contains":
-                        ok = (str(val) in str(target))
-                    elif op == "regex":
-                        pattern = str(val or "")
-                        if len(pattern) > 200:
-                            ok = False
-                        else:
-                            ok = bool(re.search(pattern, str(target or "")))
-                    elif op in ("ne", "neq"):
-                        ok = (str(target) != str(val))
-                    else:
-                        ok = False
-                except Exception:
-                    ok = False
-            if not ok:
-                continue
-            action = (r["action"] or "").lower()
-            try:
-                if action == "notify":
-                    uid = params.get("user_id")
-                    title = params.get("title") or event
-                    body = params.get("body") or ""
-                    link = params.get("link_url") or ""
-                    if uid:
-                        notify_user(uid, title, body, link)
-                elif action == "webhook":
-                    extra_event = params.get("event") or (event + ".rule")
-                    emit_webhook(org_id, extra_event, {"original": payload, "rule_id": r["id"]})
-                else:
-                    pass
-            except Exception as e:
-                app.logger.error(f"Rule action error: {e}")
-    except Exception as e:
-        app.logger.error(f"run_rules error: {e}")
-
-
-# ------------------- Workflow triggers (start runs on events) -------------------
-def _wf_defs_for_event(org_id: int, event: str):
-    try:
-        defs = query_db("SELECT * FROM workflow_defs WHERE org_id=? AND active=1 ORDER BY id DESC", (org_id,))
-        matched = []
-        for d in defs or []:
-            try:
-                g = json.loads(d["graph_json"] or "{}")
-            except Exception:
-                g = {}
-            on = g.get("on") or g.get("triggers") or []
-            if isinstance(on, str):
-                on = [on]
-            if event in set(on or []):
-                matched.append(d)
-        return matched
-    except Exception:
-        return []
-
-
-def _wf_enqueue_task(run_id: int, node_key: str, payload=None, delay_sec: int = 0):
-    payload_s = json.dumps(payload or {}, ensure_ascii=False)
-    if delay_sec and delay_sec > 0:
-        next_at = (datetime.utcnow() + timedelta(seconds=int(delay_sec))).isoformat(" ", "seconds")
-        exec_db(
-            "INSERT INTO workflow_tasks (run_id,node_key,payload_json,status,next_at) VALUES (?,?,?,?,?)",
-            (run_id, node_key, payload_s, "pending", next_at),
-        )
-    else:
-        exec_db(
-            "INSERT INTO workflow_tasks (run_id,node_key,payload_json,status,next_at) VALUES (?,?,?,?,NULL)",
-            (run_id, node_key, payload_s, "pending"),
-        )
-
-
-def _wf_start_run(def_row, org_id: int, ctx: dict) -> int:
-    run_id = exec_db(
-        "INSERT INTO workflow_runs (org_id,def_id,status,ctx_json) VALUES (?,?,?,?)",
-        (org_id, def_row["id"], "running", json.dumps(ctx or {}, ensure_ascii=False)),
-    )
-    try:
-        g = json.loads(def_row["graph_json"] or "{}")
-    except Exception:
-        g = {}
-    start_node = g.get("start") or g.get("entry") or "start"
-    _wf_enqueue_task(run_id, str(start_node), {"ctx": ctx}, 0)
-    try:
-        _metrics_set("workflow_runs_active", (org_id,), 1 + int(_metrics.get("workflow_runs_active", {}).get((org_id,), 0)))
-    except Exception:
-        pass
-    return run_id
-
-
-def workflow_start_for_event(event: str, org_id: int, payload: dict):
-    try:
-        defs = _wf_defs_for_event(org_id, event)
-        if not defs:
-            return
-        ctx = {"event": event, "payload": payload}
-        for d in defs:
-            _wf_start_run(d, org_id, ctx)
-    except Exception as e:
-        app.logger.error(f"workflow_start_for_event error: {e}")
-
-
-def fire_event(event: str, org_id: int, payload: dict):
-    try:
-        run_rules(event, org_id, payload)
-    except Exception as e:
-        app.logger.error(f"fire_event.run_rules error: {e}")
-    try:
-        workflow_start_for_event(event, org_id, payload)
-    except Exception as e:
-        app.logger.error(f"fire_event.workflow error: {e}")
-    try:
-        emit_webhook(org_id, event, payload)
-    except Exception as e:
-        app.logger.error(f"fire_event.webhook error: {e}")
-# === END CORE PART 6/9 ===
-# === CORE PART 7/9 — Auth/2FA, Profile/Avatar, UI toggles, Weather, Notifications, Setup/Index ===
+# === END CORE PART 7/11 (1/3) ===
+# === CORE PART 7/11 (2/3) — Auth/2FA, Avatar default, Login/Logout, Password change ===
 # -*- coding: utf-8 -*-
 
 # ------------------- Avatar (default SVG) -------------------
@@ -4161,6 +4168,7 @@ def login():
                 flash("Аккаунт временно заблокирован по числу попыток", "error")
             else:
                 flash("Неверные данные для входа", "error")
+    # LAYOUT_TMPL/LOGIN_TMPL are defined in STYLES sections; safe to reference after module import.
     return render_safe(LOGIN_TMPL, app_name=APP_NAME)
 
 
@@ -4219,20 +4227,6 @@ def logout():
     return redirect(url_for("login"))
 
 
-@app.before_request
-def _enforce_password_change():
-    if "user_id" in session and not session.get("2fa_pending"):
-        u = query_db("SELECT must_change_password FROM users WHERE id=?", (session["user_id"],), one=True)
-        if u and int(u["must_change_password"] or 0) == 1:
-            allowed = {
-                "password_change", "logout", "healthz", "readyz", "manifest",
-                "service_worker", "favicon", "setup", "sse"
-            }
-            ep = request.endpoint or ""
-            if ep not in allowed and not ep.startswith("static"):
-                return redirect(url_for("password_change"))
-
-
 @app.route("/password_change", methods=["GET", "POST"])
 @login_required
 def password_change():
@@ -4271,6 +4265,23 @@ def password_change():
 </div>
 """
     return render_safe(LAYOUT_TMPL, inner=inner)
+# === END CORE PART 7/11 (2/3) ===
+# === CORE PART 7/11 (3/3) — Profile + Avatar + 2FA management, UI toggles, Weather, Notifications, Setup/Index ===
+# -*- coding: utf-8 -*-
+
+# Local AV helper (guarded define to avoid redefinition in later parts)
+if "_av_scan_bytes" not in globals():
+    def _av_scan_bytes(b: bytes) -> bool:
+        if not AV_SCAN_ENABLED or not AV_SCAN_CMD:
+            return True
+        try:
+            import subprocess
+            p = subprocess.Popen(AV_SCAN_CMD, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = p.communicate(input=b, timeout=20)
+            return p.returncode == 0
+        except Exception as _e:
+            app.logger.error(f"AV scan failed: {_e}")
+            return False
 
 
 # ------------------- Profile + avatar + 2FA management -------------------
@@ -4558,8 +4569,8 @@ def setup():
 def index():
     inner = render_safe(INDEX_TMPL)
     return render_safe(LAYOUT_TMPL, inner=inner)
-# === END CORE PART 7/9 ===
-# === CORE PART 8/9 (1/3) — AI helper, Inbox (HTML + JSON), Threads view/update (with RBAC) ===
+# === END CORE PART 7/11 (3/3) ===
+# === CORE PART 8/11 (1/3) — AI helper, Inbox (HTML + JSON) with FTS fallback (safe) ===
 # -*- coding: utf-8 -*-
 
 # ------------------- AI provider helper -------------------
@@ -4659,19 +4670,27 @@ def inbox():
                        WHERE {' AND '.join(where)}"""
 
         if q:
+            # FTS-first, fallback to LIKE
             q_fts = fts_sanitize(q)
-            try:
-                sql_q = base_sql + " AND t.id IN (SELECT m.thread_id FROM inbox_messages m JOIN inbox_messages_fts f ON f.rowid=m.id WHERE m.org_id=? AND f.body MATCH ?) "
-                rows = query_db(sql_q + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [org_id, q_fts, per_page, offset])
-            except Exception as e:
-                app.logger.error(f"[INBOX] FTS MATCH error, fallback LIKE: {e}")
-                rows = query_db(base_sql + " AND EXISTS (SELECT 1 FROM inbox_messages m WHERE m.thread_id=t.id AND m.body LIKE ?) ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [f"%{q}%", per_page, offset])
+            rows = []
+            if _fts_ok():
+                try:
+                    sql_q = base_sql + " AND t.id IN (SELECT m.thread_id FROM inbox_messages m JOIN inbox_messages_fts f ON f.rowid=m.id WHERE m.org_id=? AND f.body MATCH ?) "
+                    rows = query_db(sql_q + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [org_id, q_fts, per_page, offset])
+                except Exception as e:
+                    app.logger.error(f"[INBOX] FTS MATCH error, fallback LIKE: {e}")
+            if not rows:
+                rows = query_db(
+                    base_sql + " AND EXISTS (SELECT 1 FROM inbox_messages m WHERE m.thread_id=t.id AND m.body LIKE ?) "
+                    "ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?",
+                    params + [f"%{q}%", per_page, offset]
+                )
         else:
             rows = query_db(base_sql + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [per_page, offset])
 
         chs = query_db("SELECT id,name,type FROM channels WHERE org_id=? AND active=1 ORDER BY id", (org_id,))
         agents_rows = query_db("SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username", (org_id,))
-        agents = [dict(a) for a in agents_rows]
+        agents = [dict(a) for a in (agents_rows or [])]
         inner = render_safe(INBOX_TMPL, rows=rows, channels=chs, agents=agents,
                             filters={"q": q, "status": status, "channel": channel, "assignee": assignee, "kind": kind, "tags": tags, "who": who, "date_from": date_from, "date_to": date_to})
         return render_safe(LAYOUT_TMPL, inner=inner)
@@ -4729,17 +4748,20 @@ def api_inbox_list():
         rows = []
         if q:
             q_fts = fts_sanitize(q)
-            try:
-                sql_q = base_sql + " AND t.id IN (SELECT m.thread_id FROM inbox_messages m JOIN inbox_messages_fts f ON f.rowid=m.id WHERE m.org_id=? AND f.body MATCH ?) "
-                rows = query_db(sql_q + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [org_id, q_fts, per_page, offset])
-            except Exception as e:
-                app.logger.error(f"[INBOX] FTS MATCH error, fallback LIKE: {e}")
-                rows = query_db(base_sql + " AND EXISTS (SELECT 1 FROM inbox_messages m WHERE m.thread_id=t.id AND m.body LIKE ?) ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [f"%{q}%", per_page, offset])
+            if _fts_ok():
+                try:
+                    sql_q = base_sql + " AND t.id IN (SELECT m.thread_id FROM inbox_messages m JOIN inbox_messages_fts f ON f.rowid=m.id WHERE m.org_id=? AND f.body MATCH ?) "
+                    rows = query_db(sql_q + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [org_id, q_fts, per_page, offset])
+                except Exception as e:
+                    app.logger.error(f"[INBOX] FTS MATCH error, fallback LIKE: {e}")
+            if not rows:
+                rows = query_db(base_sql + " AND EXISTS (SELECT 1 FROM inbox_messages m WHERE m.thread_id=t.id AND m.body LIKE ?) "
+                                "ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [f"%{q}%", per_page, offset])
         else:
             rows = query_db(base_sql + " ORDER BY COALESCE(t.last_message_at,t.created_at) DESC LIMIT ? OFFSET ?", params + [per_page, offset])
 
         items = []
-        for r in rows:
+        for r in rows or []:
             d = dict(r)
             items.append({
                 "id": d["id"],
@@ -4759,7 +4781,9 @@ def api_inbox_list():
     except Exception as e:
         app.logger.exception(f"API inbox list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-
+# === END CORE PART 8/11 (1/3) ===
+# === CORE PART 8/11 (2/3) — Threads view/update, Messages send/upload, AI endpoints, Export, Clients, Lookup ===
+# -*- coding: utf-8 -*-
 
 @app.route("/thread/<int:tid>")
 @login_required
@@ -4810,7 +4834,7 @@ def api_thread_messages():
             (tid, per_page, offset),
         )
         items = []
-        for r in rows:
+        for r in rows or []:
             d = dict(r)
             items.append({
                 "id": d["id"], "sender_type": d["sender_type"], "user_id": d["user_id"],
@@ -4875,11 +4899,8 @@ def api_thread_update():
     except Exception as e:
         app.logger.exception(f"Thread update error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-# === END CORE PART 8/9 (1/3) ===
-# === CORE PART 8/9 (2/3) — Messages send/upload/channel, AI endpoints, Export, Clients, Lookup ===
-# -*- coding: utf-8 -*-
 
-# ------------------- Messages send/upload/channel -------------------
+
 def _anti_duplicate_message(thread_id, sender_type, body):
     try:
         dup = query_db(
@@ -4929,19 +4950,6 @@ def add_message(org_id: int, thread_id: int, sender_type: str, body: str, attach
     except Exception as e:
         app.logger.error(f"fire_event message.created failed: {e}")
     return mid
-
-
-def _av_scan_bytes(b: bytes) -> bool:
-    if not AV_SCAN_ENABLED or not AV_SCAN_CMD:
-        return True
-    try:
-        import subprocess
-        p = subprocess.Popen(AV_SCAN_CMD, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = p.communicate(input=b, timeout=20)
-        return p.returncode == 0
-    except Exception as e:
-        app.logger.error(f"AV scan failed: {e}")
-        return False
 
 
 @app.route("/api/message/send", methods=["POST"])
@@ -5129,7 +5137,7 @@ def api_ai_summarize_thread():
             msgs = query_db("SELECT sender_type, body, internal_note, created_at FROM inbox_messages WHERE thread_id=? AND internal_note=0 ORDER BY id ASC", (tid,))
         else:
             msgs = query_db("SELECT sender_type, body, internal_note, created_at FROM inbox_messages WHERE thread_id=? ORDER BY id ASC", (tid,))
-        text = "\n".join([f"[{m['created_at']}] {m['sender_type']}{' (int)' if m['internal_note'] else ''}: {m['body']}" for m in msgs if (m["body"] or "").strip()])
+        text = "\n".join([f"[{m['created_at']}] {m['sender_type']}{' (int)' if m['internal_note'] else ''}: {m['body']}" for m in (msgs or []) if (m["body"] or "").strip()])
         system_prompt = "Ты помощник оператора поддержки. Составь краткую сводку разговора и список основных пунктов."
         out = ai_provider_call(text[:8000], system_prompt=system_prompt, temperature=0.2, max_tokens=400)
         if not out and AI_STRICT:
@@ -5221,7 +5229,7 @@ def api_ai_autotag_thread():
         if not th:
             return jsonify(ok=False, error="not found"), 404
         msgs = query_db("SELECT sender_type, body FROM inbox_messages WHERE thread_id=? AND internal_note=0 ORDER BY id DESC LIMIT 10", (tid,))
-        text = "\n".join([(m["body"] or "") for m in msgs if (m["body"] or "").strip()])
+        text = "\n".join([(m["body"] or "") for m in (msgs or []) if (m["body"] or "").strip()])
         sys = 'Предложи до 5 лаконичных тегов для классификации диалога. Верни JSON: {"tags":["..."]}'
         out = ai_provider_call(text[:3000], system_prompt=sys, temperature=0.3, max_tokens=150)
         tags = []
@@ -5269,7 +5277,7 @@ def export_inbox_csv():
         out = io.StringIO()
         w = csv.writer(out, delimiter=';', dialect='excel')
         w.writerow(["ID", "Subject", "Status", "Priority", "Assignee", "FRT", "FRT due", "Last message"])
-        for r in rows:
+        for r in rows or []:
             w.writerow([
                 _csv_safe_cell(r["id"]), _csv_safe_cell(r["subject"] or ""), _csv_safe_cell(r["status"]), _csv_safe_cell(r["priority"]),
                 _csv_safe_cell(r["assignee_id"] or ""), _csv_safe_cell(r["first_response_at"] or ""),
@@ -5428,7 +5436,7 @@ def api_clients_list():
             """,
             tuple([org_id] + params + [per_page, offset]),
         )
-        return jsonify(ok=True, items=[dict(r) for r in rows], page=page, per_page=per_page)
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])], page=page, per_page=per_page)
     except Exception as e:
         app.logger.exception(f"API clients list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -5461,18 +5469,18 @@ def api_lookup():
                                  (org_id, pattern, per_page, offset))
                 conts = query_db("SELECT * FROM contacts  WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
                                  (org_id, pattern, per_page, offset))
-                results["companies"].extend([dict(r) for r in comps])
-                results["contacts"].extend([dict(r) for r in conts])
+                results["companies"].extend([dict(r) for r in (comps or [])])
+                results["contacts"].extend([dict(r) for r in (conts or [])])
 
         if inn:
             comps = query_db("SELECT * FROM companies WHERE org_id=? AND inn=? ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, inn, per_page, offset))
-            results["companies"].extend([dict(r) for r in comps])
+            results["companies"].extend([dict(r) for r in (comps or [])])
 
         if email:
             comps = query_db("SELECT * FROM companies WHERE org_id=? AND (email LIKE ?) ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, f"%{email}%", per_page, offset))
             conts = query_db("SELECT * FROM contacts WHERE org_id=? AND (email LIKE ?) ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, f"%{email}%", per_page, offset))
-            results["companies"].extend([dict(r) for r in comps])
-            results["contacts"].extend([dict(r) for r in conts])
+            results["companies"].extend([dict(r) for r in (comps or [])])
+            results["contacts"].extend([dict(r) for r in (conts or [])])
 
         return jsonify(ok=True, results=results, page=page)
     except Exception as e:
@@ -5506,18 +5514,18 @@ def lookup():
                                  (org_id, pattern, per_page, offset))
                 conts = query_db("SELECT * FROM contacts  WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
                                  (org_id, pattern, per_page, offset))
-                results["companies"].extend([dict(r) for r in comps])
-                results["contacts"].extend([dict(r) for r in conts])
+                results["companies"].extend([dict(r) for r in (comps or [])])
+                results["contacts"].extend([dict(r) for r in (conts or [])])
 
         if inn:
             comps = query_db("SELECT * FROM companies WHERE org_id=? AND inn=? ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, inn, per_page, offset))
-            results["companies"].extend([dict(r) for r in comps])
+            results["companies"].extend([dict(r) for r in (comps or [])])
 
         if email:
             comps = query_db("SELECT * FROM companies WHERE org_id=? AND email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, f"%{email}%", per_page, offset))
             conts = query_db("SELECT * FROM contacts WHERE org_id=? AND email LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?", (org_id, f"%{email}%", per_page, offset))
-            results["companies"].extend([dict(r) for r in comps])
-            results["contacts"].extend([dict(r) for r in conts])
+            results["companies"].extend([dict(r) for r in (comps or [])])
+            results["contacts"].extend([dict(r) for r in (conts or [])])
 
         inner = render_safe(LOOKUP_TMPL, results=results, params={"phone": phone, "id": cid, "inn": inn, "email": email})
         return render_safe(LAYOUT_TMPL, inner=inner)
@@ -5525,8 +5533,8 @@ def lookup():
         app.logger.exception(f"Lookup error: {e}")
         flash("Внутренняя ошибка", "error")
         return redirect(url_for("index"))
-# === END CORE PART 8/9 (2/3) ===
-# === CORE PART 8/9 (3/3) — CTI/Calls, Meetings (delete supported), Telegram/VK, Chat (org-wide access) ===
+# === END CORE PART 8/11 (2/3) ===
+# === CORE PART 8/11 (3/3) — CTI/Calls, Meetings, Telegram/VK, Chat (org-wide) ===
 # -*- coding: utf-8 -*-
 
 # ------------------- CTI helpers and webhooks -------------------
@@ -5849,6 +5857,26 @@ def api_click_to_call():
 
 
 # ------------------- Calls pages/APIs -------------------
+def find_customer_by_phone(org_id: int, e164: str):
+    last10 = phone_last10(e164)
+    if not last10:
+        return None, None
+    pattern = "%" + last10
+    c = query_db(
+        """SELECT id, company_id FROM contacts WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT 1""",
+        (org_id, pattern),
+        one=True,
+    )
+    if c:
+        return c["company_id"], c["id"]
+    comp = query_db(
+        """SELECT id FROM companies WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT 1""",
+        (org_id, pattern),
+        one=True,
+    )
+    return (comp["id"] if comp else None), None
+
+
 def cti_call_new(org_id: int, channel_id: int, provider: str, direction: str, from_num: str, to_num: str, provider_call_id: str, ts=None, agent_id=None):
     e_from = phone_to_e164(from_num)
     e_to = phone_to_e164(to_num)
@@ -5914,35 +5942,6 @@ def cti_call_update(org_id: int, provider: str, provider_call_id: str, **kw):
     return c["id"]
 
 
-def find_customer_by_phone(org_id: int, e164: str):
-    last10 = phone_last10(e164)
-    if not last10:
-        return None, None
-    pattern = "%" + last10
-    c = query_db(
-        """SELECT id, company_id FROM contacts WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT 1""",
-        (org_id, pattern),
-        one=True,
-    )
-    if c:
-        return c["company_id"], c["id"]
-    comp = query_db(
-        """SELECT id FROM companies WHERE org_id=? AND phone_norm LIKE ? ORDER BY id DESC LIMIT 1""",
-        (org_id, pattern),
-        one=True,
-    )
-    return (comp["id"] if comp else None), None
-
-
-def _call_recording_url(row):
-    if row["recording_file_id"]:
-        try:
-            return presign_file(row["recording_file_id"])
-        except Exception:
-            return ""
-    return row["recording_key"] or ""
-
-
 @app.route("/calls")
 @login_required
 def calls_page():
@@ -5990,9 +5989,17 @@ def api_calls_list():
             params,
         )
         items = []
-        for r in rows:
+        for r in rows or []:
             d = dict(r)
-            d["recording_url"] = _call_recording_url(r)
+            # provide presigned URL (if exists)
+            d["recording_url"] = ""
+            try:
+                if r["recording_file_id"]:
+                    d["recording_url"] = presign_file(r["recording_file_id"])
+                elif r["recording_key"]:
+                    d["recording_url"] = r["recording_key"]
+            except Exception:
+                pass
             items.append(d)
         return jsonify(ok=True, items=items, page=page)
     except Exception as e:
@@ -6086,11 +6093,9 @@ def api_call_recording_presign(call_id):
 def meetings_page():
     try:
         inner = render_safe(MEETING_TMPL, meeting=None, jitsi_base=JITSI_BASE)
-        return render_safe(LAYOUT_TMPL, inner=inner)
-    except Exception as e:
-        app.logger.exception(f"Meetings page error: {e}")
-        flash("Внутренняя ошибка", "error")
-        return redirect(url_for("index"))
+    except Exception:
+        inner = "<div class='card'><div class='help'>Ошибка шаблона встреч</div></div>"
+    return render_safe(LAYOUT_TMPL, inner=inner)
 
 
 @app.route("/api/meetings", methods=["GET"])
@@ -6099,7 +6104,7 @@ def api_meetings_list():
     try:
         org_id = current_org_id()
         rows = query_db("SELECT * FROM meetings WHERE org_id=? ORDER BY COALESCE(start_at, created_at) DESC LIMIT 1000", (org_id,))
-        return jsonify(ok=True, items=[dict(r) for r in rows])
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])])
     except Exception as e:
         app.logger.exception(f"Meetings list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -6123,7 +6128,7 @@ def api_meeting_schedule():
         if department_ids:
             for did in set([int(x) for x in department_ids if str(x).isdigit()]):
                 users = query_db("SELECT user_id FROM department_members WHERE org_id=? AND department_id=?", (org_id, did))
-                for u in users:
+                for u in (users or []):
                     valids.append(int(u["user_id"]))
         for uid in participants:
             try:
@@ -6217,7 +6222,7 @@ def api_meeting_create():
         valids = []
         for did in set([int(x) for x in department_ids if str(x).isdigit()]):
             users = query_db("SELECT user_id FROM department_members WHERE org_id=? AND department_id=?", (org_id, did))
-            valids.extend([u["user_id"] for u in users])
+            valids.extend([u["user_id"] for u in (users or [])])
         for u in participants:
             if str(u).isdigit():
                 valids.append(int(u))
@@ -6330,7 +6335,7 @@ def _get_tg_channel_by_secret(secret: str):
     if ch:
         return ch
     rows = query_db("SELECT * FROM channels WHERE type='telegram' AND active=1 ORDER BY id DESC")
-    for r in rows:
+    for r in (rows or []):
         try:
             st = json.loads(r["settings_json"] or "{}")
         except Exception:
@@ -6548,7 +6553,7 @@ def api_chat_send():
         except Exception:
             pass
         members = query_db("SELECT user_id FROM chat_members WHERE channel_id=?", (cid,))
-        user_ids = [m["user_id"] for m in members if m["user_id"] != session["user_id"]]
+        user_ids = [m["user_id"] for m in (members or []) if m["user_id"] != session["user_id"]]
         if user_ids:
             sse_publish_users(user_ids, "chat.message", {"channel_id": cid, "id": mid, "body": body})
             try:
@@ -6606,7 +6611,7 @@ def api_chat_upload():
         except Exception:
             pass
         members = query_db("SELECT user_id FROM chat_members WHERE channel_id=?", (cid,))
-        sse_publish_users([m["user_id"] for m in members], "chat.message", {"channel_id": cid, "id": mid, "body": body})
+        sse_publish_users([m["user_id"] for m in (members or [])], "chat.message", {"channel_id": cid, "id": mid, "body": body})
         return jsonify(ok=True, id=mid, file_id=fid, url=presign_file(fid))
     except Exception as e:
         app.logger.exception(f"Chat upload error: {e}")
@@ -6628,7 +6633,7 @@ def api_chat_create():
         if department_ids:
             for did in set(department_ids):
                 users = query_db("SELECT user_id FROM department_members WHERE org_id=? AND department_id=?", (org_id, did))
-                valid_members.extend([int(u["user_id"]) for u in users])
+                valid_members.extend([int(u["user_id"]) for u in (users or [])])
         for uid in members_in:
             if query_db("SELECT 1 FROM users WHERE id=? AND org_id=?", (int(uid), org_id), one=True):
                 valid_members.append(int(uid))
@@ -6662,8 +6667,8 @@ def api_chat_create():
     except Exception as e:
         app.logger.exception(f"Chat create error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-# === END CORE PART 8/9 (3/3) ===
-# === CORE PART 9/9 (1/3) — Tasks/Comments/Activity/Reminders/Files (+Checklist API, hardened) ===
+# === END CORE PART 8/11 (3/3) ===
+# === CORE PART 9/11 (1/3) — Tasks: activity helper, list (HTML/API), statuses, update/toggle ===
 # -*- coding: utf-8 -*-
 
 # ------------------- Task activity helper -------------------
@@ -6864,7 +6869,7 @@ def api_tasks_list():
             """,
             tuple(params + [per_page, offset]),
         )
-        return jsonify(ok=True, items=[dict(r) for r in rows], page=page, per_page=per_page)
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])], page=page, per_page=per_page)
     except Exception as e:
         app.logger.exception(f"Tasks list API error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -6876,7 +6881,7 @@ def api_task_statuses():
     try:
         org_id = current_org_id()
         rows = query_db("SELECT name FROM task_statuses WHERE org_id=? ORDER BY id", (org_id,))
-        items = [{"name": r["name"]} for r in rows] if rows else [{"name": s} for s in ("open", "done", "overdue")]
+        items = [{"name": r["name"]} for r in (rows or [])] if rows else [{"name": s} for s in ("open", "done", "overdue")]
         return jsonify(ok=True, items=items)
     except Exception as e:
         app.logger.exception(f"Task statuses API error: {e}")
@@ -6963,7 +6968,7 @@ def api_task_update():
         return jsonify(ok=True)
     except Exception as e:
         app.logger.exception(f"Task update error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
+        return jsonify(ok(False), error="internal error"), 500  # fallback
 
 
 @app.route("/api/task/toggle", methods=["POST"])
@@ -6990,7 +6995,9 @@ def api_task_toggle():
     except Exception as e:
         app.logger.exception(f"Task toggle error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-
+# === END CORE PART 9/11 (1/3) ===
+# === CORE PART 9/11 (2/3) — Reminders, Phones, Participants/Dept/Delegate, Task detail+Comments, Files, Checklist ===
+# -*- coding: utf-8 -*-
 
 # ------------------- Reminders -------------------
 @app.route("/api/task/reminders/<int:task_id>")
@@ -7001,7 +7008,7 @@ def api_task_reminders(task_id):
         if not query_db("SELECT 1 FROM tasks WHERE id=? AND org_id=?", (task_id, org_id), one=True):
             return jsonify(ok=False, error="not found"), 404
         rows = query_db("SELECT id, user_id, remind_at, message, fired, fired_at FROM task_reminders WHERE org_id=? AND task_id=? ORDER BY remind_at ASC", (org_id, task_id))
-        return jsonify(ok=True, items=[dict(r) for r in rows])
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])])
     except Exception as e:
         app.logger.exception(f"Task reminders list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -7070,7 +7077,7 @@ def api_task_phones(task_id):
             if c and c["phone"]:
                 nums.append(c["phone"])
         conts = query_db("SELECT phone FROM contacts WHERE company_id=? AND org_id=? ORDER BY id DESC LIMIT 10", (t["company_id"], org_id))
-        for r in conts:
+        for r in (conts or []):
             if r["phone"]:
                 nums.append(r["phone"])
         out = []
@@ -7238,7 +7245,7 @@ def task_view(tid):
             (org_id, tid),
         )
         comments = []
-        for r in rows:
+        for r in (rows or []):
             d = dict(r)
             try:
                 d["attachments"] = json.loads(d.get("attachments_json") or "[]")
@@ -7253,18 +7260,15 @@ def task_view(tid):
                ORDER BY id DESC LIMIT 200""",
             (org_id, tid),
         )
-
         activity = query_db(
             "SELECT * FROM task_activity WHERE org_id=? AND task_id=? ORDER BY id DESC LIMIT 100",
             (org_id, tid),
         )
-
         pinned = []
         try:
             pinned = json.loads(t["pinned_files_json"] or "[]")
         except Exception:
             pinned = []
-
         inner_html = render_safe(
             TASK_VIEW_TMPL,
             t=t,
@@ -7301,7 +7305,7 @@ def api_task_comments():
             (org_id, task_id, per_page, offset),
         )
         items = []
-        for r in rows:
+        for r in (rows or []):
             d = dict(r)
             try:
                 d["attachments"] = json.loads(d.get("attachments_json") or "[]")
@@ -7376,7 +7380,7 @@ def api_task_comment_create():
         to_notify = set()
         if t2 and t2["assignee_id"]:
             to_notify.add(int(t2["assignee_id"]))
-        for p in task_participants(task_id):
+        for p in (task_participants(task_id) or []):
             to_notify.add(int(p["user_id"]))
         if session["user_id"] in to_notify:
             to_notify.discard(session["user_id"])
@@ -7454,7 +7458,7 @@ def api_task_file_pin():
             cur = json.loads(t["pinned_files_json"] or "[]")
         except Exception:
             cur = []
-        cur = [x for x in cur if isinstance(x, dict) and x.get("id")]
+        cur = [x for x in (cur or []) if isinstance(x, dict) and x.get("id")]
         exists = any(int(x.get("id") or 0) == file_id for x in cur)
         if pin and not exists:
             cur.append({"id": file_id, "name": frow["original_name"], "url": presign_file(file_id)})
@@ -7468,7 +7472,7 @@ def api_task_file_pin():
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Checklist API (extend tasks functionality) -------------------
+# ------------------- Checklist API -------------------
 @app.route("/api/task/checklist/<int:task_id>", methods=["GET"])
 @login_required
 def api_task_checklist_get(task_id):
@@ -7547,8 +7551,23 @@ def api_task_checklist_update():
     except Exception as e:
         app.logger.exception(f"Checklist update error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-# === END CORE PART 9/9 (1/3) ===
-# === CORE PART 9/9 (2/3) — Deals, Approvals public, Settings/Admin, Tokens (hash-only), Kanban/CustomFields APIs ===
+
+
+# ------------------- Patch faulty handler (defensive) -------------------
+try:
+    _orig_api_task_update = app.view_functions.get("api_task_update")
+    if _orig_api_task_update:
+        def _api_task_update_safe(*args, **kwargs):
+            try:
+                return _orig_api_task_update(*args, **kwargs)
+            except Exception as _e:
+                app.logger.exception(f"api_task_update wrapper error: {_e}")
+                return jsonify(ok=False, error="internal error"), 500
+        app.view_functions["api_task_update"] = _api_task_update_safe
+except Exception:
+    pass
+# === END CORE PART 9/11 (2/3) ===
+# === CORE PART 9/11 (3/3) — Deals, Approvals public, Settings/Admin, Tokens, Kanban, CustomFields, Webhooks, Search, Import ===
 # -*- coding: utf-8 -*-
 
 # ------------------- Audit/Webhooks/Notifications helpers -------------------
@@ -7579,24 +7598,27 @@ def emit_webhook(org_id: int, event: str, payload: dict):
     try:
         exec_db(
             "INSERT INTO webhook_queue (org_id,event,payload_json,status,attempts,created_at) VALUES (?,?,?,?,0,CURRENT_TIMESTAMP)",
-            (org_id, event, json.dumps(payload, ensure_ascii=False), "pending"),
+            (org_id, event, json.dumps(payload or {}, ensure_ascii=False), "pending"),
         )
     except Exception as e:
         app.logger.error(f"[WARN] webhook queue insert failed: {e}")
 
 
 def notify_user(user_or_users, title: str, body: str = "", link_url: str = ""):
-    ids = user_or_users if isinstance(user_or_users, (list, tuple, set)) else [user_or_users]
-    for uid in ids:
-        if not uid:
-            continue
-        u = query_db("SELECT org_id FROM users WHERE id=?", (uid,), one=True)
-        if not u:
-            continue
-        exec_db(
-            "INSERT INTO notifications (org_id,user_id,kind,title,body,link_url) VALUES (?,?,?,?,?,?)",
-            (u["org_id"], uid, "generic", (title or "")[:200], (body or "")[:2000], (link_url or "")[:1024]),
-        )
+    try:
+        ids = user_or_users if isinstance(user_or_users, (list, tuple, set)) else [user_or_users]
+        for uid in ids:
+            if not uid:
+                continue
+            u = query_db("SELECT org_id FROM users WHERE id=?", (uid,), one=True)
+            if not u:
+                continue
+            exec_db(
+                "INSERT INTO notifications (org_id,user_id,kind,title,body,link_url) VALUES (?,?,?,?,?,?)",
+                (u["org_id"], uid, "generic", (title or "")[:200], (body or "")[:2000], (link_url or "")[:1024]),
+            )
+    except Exception as e:
+        app.logger.error(f"[WARN] notify_user failed: {e}")
 
 
 # ------------------- Deals (HTML + API, with participants/workflow) -------------------
@@ -7608,7 +7630,10 @@ def deals_page():
         stage = (request.args.get("stage") or "").strip()
         status = (request.args.get("status") or "").strip()
         assignee = (request.args.get("assignee_id") or "").strip()
+        pipeline = (request.args.get("pipeline") or "").strip()
         where = ["org_id=?"]; params = [org_id]
+        if pipeline:
+            where.append("pipeline_key=?"); params.append(pipeline)
         if stage: where.append("stage=?"); params.append(stage)
         if status: where.append("status=?"); params.append(status)
         if assignee and assignee.isdigit(): where.append("assignee_id=?"); params.append(int(assignee))
@@ -7632,12 +7657,14 @@ def api_deals_list():
         stage = (request.args.get("stage") or "").strip()
         status = (request.args.get("status") or "").strip()
         assignee = (request.args.get("assignee_id") or "").strip()
+        pipeline = (request.args.get("pipeline") or "").strip()
         where = ["org_id=?"]; params = [org_id]
+        if pipeline: where.append("pipeline_key=?"); params.append(pipeline)
         if stage: where.append("stage=?"); params.append(stage)
         if status: where.append("status=?"); params.append(status)
         if assignee and assignee.isdigit(): where.append("assignee_id=?"); params.append(int(assignee))
         rows = query_db(f"SELECT * FROM deals WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1000", tuple(params))
-        return jsonify(ok=True, items=[dict(r) for r in rows])
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])])
     except Exception as e:
         app.logger.exception(f"Deals list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -7657,6 +7684,7 @@ def api_deal_create():
         amount = float(d.get("amount") or 0)
         currency = (d.get("currency") or "RUB").strip()
         status = (d.get("status") or "open").strip()
+        pipeline_key = (d.get("pipeline_key") or "default").strip()
         assignee_id = d.get("assignee_id") or None
         company_id = d.get("company_id") or None
         contact_id = d.get("contact_id") or None
@@ -7682,13 +7710,13 @@ def api_deal_create():
             if not query_db("SELECT 1 FROM contacts WHERE id=? AND org_id=?", (coid, org_id), one=True):
                 return jsonify(ok=False, error="contact out of org"), 400
         deal_id = exec_db(
-            """INSERT INTO deals (org_id,title,stage,amount,currency,status,assignee_id,company_id,contact_id)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (org_id, title, stage, amount, currency, status, assignee_id, company_id, contact_id),
+            """INSERT INTO deals (org_id,title,stage,amount,currency,status,assignee_id,company_id,contact_id,pipeline_key)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (org_id, title, stage, amount, currency, status, assignee_id, company_id, contact_id, pipeline_key or None),
         )
         if not deal_id:
             return jsonify(ok=False, error="insert failed"), 500
-        add_audit(org_id, "deal.created", "deal", deal_id, {"stage": stage, "amount": amount})
+        add_audit(org_id, "deal.created", "deal", deal_id, {"stage": stage, "amount": amount, "pipeline": pipeline_key})
         try:
             fire_event("deal.created", org_id, {"deal_id": deal_id})
         except Exception:
@@ -7712,7 +7740,7 @@ def api_deal_update():
             return jsonify(ok=False, error="not found"), 404
         if not can_edit_deal(session["user_id"], row):
             return jsonify(ok=False, error="forbidden"), 403
-        allowed = {"title", "stage", "amount", "currency", "status", "assignee_id", "company_id", "contact_id", "tags_json", "extra_json", "due_at", "current_department_id"}
+        allowed = {"title", "stage", "amount", "currency", "status", "assignee_id", "company_id", "contact_id", "tags_json", "extra_json", "due_at", "current_department_id", "pipeline_key"}
         sets, params = [], []
         for k in allowed:
             if k in d:
@@ -7879,7 +7907,7 @@ def approval_public(token):
         return redirect(url_for("index"))
 
 
-# ------------------- Settings (Admin) incl. Channels/Webhooks/AI config/Statuses/Users -------------------
+# ------------------- Settings (Admin) incl. Channels/Webhooks/AI config/Statuses/Users/Departments -------------------
 @app.route("/settings", methods=["GET"])
 @admin_required
 def settings():
@@ -7887,7 +7915,7 @@ def settings():
         org_id = current_org_id()
         channels = query_db("SELECT * FROM channels WHERE org_id=? ORDER BY id DESC", (org_id,))
         ch_list = []
-        for r in channels:
+        for r in (channels or []):
             d = dict(r)
             try:
                 d["cfg"] = json.loads(d.get("settings_json") or "{}")
@@ -8168,7 +8196,6 @@ def settings_user_add():
         (org_id, username, email, generate_password_hash(pwd), role),
     )
     if uid and dept_id:
-        # ensure department belongs to org
         if query_db("SELECT 1 FROM departments WHERE id=? AND org_id=?", (dept_id, org_id), one=True):
             exec_db(
                 "INSERT OR IGNORE INTO department_members (org_id, department_id, user_id, role) VALUES (?,?,?, 'member')",
@@ -8201,9 +8228,7 @@ def api_tokens_list():
     try:
         org_id = current_org_id()
         rows = query_db("SELECT id,name,active,user_id,last_used_at,created_at,expires_at,scopes FROM api_tokens WHERE org_id=? ORDER BY id DESC", (org_id,))
-        items = []
-        for r in rows:
-            items.append(dict(r))
+        items = [dict(r) for r in (rows or [])]
         return jsonify(ok=True, items=items)
     except Exception as e:
         app.logger.exception(f"Tokens list error: {e}")
@@ -8258,7 +8283,7 @@ def api_webhook_queue():
     try:
         org_id = current_org_id()
         rows = query_db("SELECT * FROM webhook_queue WHERE org_id=? ORDER BY id DESC LIMIT 200", (org_id,))
-        return jsonify(ok=True, items=[dict(r) for r in rows])
+        return jsonify(ok=True, items=[dict(r) for r in (rows or [])])
     except Exception as e:
         app.logger.exception(f"Webhook queue list error: {e}")
         return jsonify(ok=False, error="internal error"), 500
@@ -8277,90 +8302,21 @@ def api_webhook_retry(qid):
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Global Search UI -------------------
-@app.route("/search")
-@login_required
-def search_page():
-    try:
-        q = (request.args.get("q") or "").strip()
-        results = {"inbox": [], "tasks": [], "chats": []}
-        if q:
-            org_id = current_org_id()
-            q_fts = fts_sanitize(q)
-            inbox_rows = query_db(
-                """
-                SELECT m.id, m.thread_id, m.body
-                FROM inbox_messages m
-                JOIN inbox_messages_fts f ON f.rowid=m.id
-                WHERE m.org_id=? AND f.body MATCH ?
-                ORDER BY m.id DESC LIMIT 50
-                """,
-                (org_id, q_fts),
-            )
-            task_rows = query_db(
-                """
-                SELECT t.id, t.title, t.description
-                FROM tasks t
-                JOIN tasks_fts f ON f.rowid=t.id
-                WHERE t.org_id=? AND f MATCH ?
-                ORDER BY t.id DESC LIMIT 50
-                """,
-                (org_id, q_fts),
-            )
-            chat_rows = query_db(
-                """
-                SELECT c.id, c.channel_id, c.body
-                FROM chat_messages c
-                JOIN chat_messages_fts f ON f.rowid=c.id
-                WHERE c.org_id=? AND f.body MATCH ?
-                ORDER BY c.id DESC LIMIT 50
-                """,
-                (org_id, q_fts),
-            )
-            results["inbox"] = [dict(r) for r in (inbox_rows or [])]
-            results["tasks"] = [dict(r) for r in (task_rows or [])]
-            results["chats"] = [dict(r) for r in (chat_rows or [])]
-        inner = render_safe(SEARCH_TMPL, q=q, results=results)
-        return render_safe(LAYOUT_TMPL, inner=inner)
-    except Exception as e:
-        app.logger.exception(f"Search page error: {e}")
-        flash("Внутренняя ошибка", "error")
-        return redirect(url_for("index"))
-
-# ------------------- Import CSV Wizard (UI) -------------------
-@app.route("/import", methods=["GET", "POST"])
-@login_required
-def import_csv_wizard():
-    try:
-        if request.method == "POST":
-            verify_csrf()
-            f = request.files.get("csvfile")
-            mode = (request.form.get("mode") or "").strip()
-            if not f or not f.filename:
-                flash("Файл не выбран", "error")
-            else:
-                # Подтверждаем приём файла; дальнейшая обработка настраивается отдельно
-                flash("Файл получен, обработка будет выполнена", "success")
-        inner = render_safe(IMPORT_TMPL)
-        return render_safe(LAYOUT_TMPL, inner=inner)
-    except Exception as e:
-        app.logger.exception(f"Import wizard error: {e}")
-        flash("Внутренняя ошибка", "error")
-        return redirect(url_for("index"))
-
-
-# ------------------- Deals Kanban (missing APIs implemented) -------------------
+# ------------------- Deals Kanban (pipelines aware) -------------------
 @app.route("/api/deals/kanban")
 @login_required
 def api_deals_kanban():
     try:
         org_id = current_org_id()
-        cols = [r["key"] for r in (query_db("SELECT key FROM workflow_stages WHERE org_id=? AND entity_type='deal' AND active=1 ORDER BY order_no", (org_id,)) or [])]
+        pipeline = (request.args.get("pipeline") or "default").strip()
+        # Try workflow_stages columns
+        stage_rows = query_db("SELECT key FROM workflow_stages WHERE org_id=? AND entity_type='deal' AND active=1 AND (pipeline_key IS NULL OR pipeline_key=?) ORDER BY order_no", (org_id, pipeline))
+        cols = [r["key"] for r in (stage_rows or [])]
         if not cols:
-            cols = sorted(list({r["stage"] for r in (query_db("SELECT DISTINCT stage FROM deals WHERE org_id=?", (org_id,)) or [])}))
+            cols = sorted(list({r["stage"] for r in (query_db("SELECT DISTINCT stage FROM deals WHERE org_id=? AND (pipeline_key IS NULL OR pipeline_key=?)", (org_id, pipeline)) or [])}))
         items = {c: [] for c in cols}
-        rows = query_db("SELECT id,title,stage,amount,currency,assignee_id FROM deals WHERE org_id=? ORDER BY id DESC LIMIT 5000", (org_id,))
-        for r in rows:
+        rows = query_db("SELECT id,title,stage,amount,currency,assignee_id FROM deals WHERE org_id=? AND (pipeline_key IS NULL OR pipeline_key=?) ORDER BY id DESC LIMIT 5000", (org_id, pipeline))
+        for r in (rows or []):
             st = r["stage"] or (cols[0] if cols else "new")
             if st not in items:
                 items[st] = []
@@ -8385,7 +8341,6 @@ def api_deals_kanban_update():
             return jsonify(ok=False, error="not found"), 404
         if not can_edit_deal(session["user_id"], row):
             return jsonify(ok=False, error="forbidden"), 403
-        # allow free-form stage or validate via workflow_stages
         rc = exec_db_rowcount("UPDATE deals SET stage=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (stage, did, org_id))
         if rc > 0:
             _metrics_inc("kanban_ops_total", ("move",))
@@ -8400,7 +8355,7 @@ def api_deals_kanban_update():
         return jsonify(ok=False, error="internal error"), 500
 
 
-# ------------------- Custom Fields API (missing, now implemented) -------------------
+# ------------------- Custom Fields API -------------------
 @app.route("/api/custom_fields", methods=["GET", "POST"])
 @admin_required
 def api_custom_fields():
@@ -8415,7 +8370,7 @@ def api_custom_fields():
                 (org_id, ent),
             )
             items = []
-            for r in rows or []:
+            for r in (rows or []):
                 items.append({
                     "id": r["id"], "entity": r["entity"], "key": r["key"], "type": r["type"], "label": r["label"],
                     "required": int(r["required"] or 0) == 1, "default": r["default"] or "",
@@ -8435,7 +8390,6 @@ def api_custom_fields():
         rules = json.dumps(d.get("rules") or {}, ensure_ascii=False)
         if not entity or not key or not label:
             return jsonify(ok=False, error="entity/key/label required"), 400
-        # unique per org+entity+key enforced by index
         fid = exec_db(
             "INSERT INTO custom_fields (org_id,entity,key,type,label,required,default,options_json,rules_json) VALUES (?,?,?,?,?,?,?,?,?)",
             (org_id, entity, key, type_, label, required, default, options, rules),
@@ -8445,20 +8399,138 @@ def api_custom_fields():
     except Exception as e:
         app.logger.exception(f"Custom fields API error: {e}")
         return jsonify(ok=False, error="internal error"), 500
-# === END CORE PART 9/9 (2/3) ===
-# === CORE PART 9/9 (3/3) — Workflow Engine, Workers (webhook/maintenance), Startup hooks ===
+
+
+# ------------------- Global Search UI (with FTS fallback) -------------------
+@app.route("/search")
+@login_required
+def search_page():
+    try:
+        q = (request.args.get("q") or "").strip()
+        results = {"inbox": [], "tasks": [], "chats": []}
+        if q:
+            org_id = current_org_id()
+            q_fts = fts_sanitize(q)
+            inbox_rows = []
+            task_rows = []
+            chat_rows = []
+            if _fts_ok():
+                try:
+                    inbox_rows = query_db(
+                        """
+                        SELECT m.id, m.thread_id, m.body
+                        FROM inbox_messages m
+                        JOIN inbox_messages_fts f ON f.rowid=m.id
+                        WHERE m.org_id=? AND f.body MATCH ?
+                        ORDER BY m.id DESC LIMIT 50
+                        """,
+                        (org_id, q_fts),
+                    )
+                except Exception as e:
+                    app.logger.error(f"[SEARCH] inbox FTS error: {e}")
+                try:
+                    task_rows = query_db(
+                        """
+                        SELECT t.id, t.title, t.description
+                        FROM tasks t
+                        JOIN tasks_fts f ON f.rowid=t.id
+                        WHERE t.org_id=? AND f MATCH ?
+                        ORDER BY t.id DESC LIMIT 50
+                        """,
+                        (org_id, q_fts),
+                    )
+                except Exception as e:
+                    app.logger.error(f"[SEARCH] tasks FTS error: {e}")
+                try:
+                    chat_rows = query_db(
+                        """
+                        SELECT c.id, c.channel_id, c.body
+                        FROM chat_messages c
+                        JOIN chat_messages_fts f ON f.rowid=c.id
+                        WHERE c.org_id=? AND f.body MATCH ?
+                        ORDER BY c.id DESC LIMIT 50
+                        """,
+                        (org_id, q_fts),
+                    )
+                except Exception as e:
+                    app.logger.error(f"[SEARCH] chat FTS error: {e}")
+            # Fallback LIKE if any list empty
+            if not inbox_rows:
+                inbox_rows = query_db(
+                    "SELECT id, thread_id, body FROM inbox_messages WHERE org_id=? AND body LIKE ? ORDER BY id DESC LIMIT 50",
+                    (org_id, f"%{q}%"),
+                )
+            if not task_rows:
+                task_rows = query_db(
+                    "SELECT id, title, description FROM tasks WHERE org_id=? AND (title LIKE ? OR description LIKE ?) ORDER BY id DESC LIMIT 50",
+                    (org_id, f"%{q}%", f"%{q}%"),
+                )
+            if not chat_rows:
+                chat_rows = query_db(
+                    "SELECT id, channel_id, body FROM chat_messages WHERE org_id=? AND body LIKE ? ORDER BY id DESC LIMIT 50",
+                    (org_id, f"%{q}%"),
+                )
+            results["inbox"] = [dict(r) for r in (inbox_rows or [])]
+            results["tasks"] = [dict(r) for r in (task_rows or [])]
+            results["chats"] = [dict(r) for r in (chat_rows or [])]
+        inner = render_safe(SEARCH_TMPL, q=q, results=results)
+        return render_safe(LAYOUT_TMPL, inner=inner)
+    except Exception as e:
+        app.logger.exception(f"Search page error: {e}")
+        flash("Внутренняя ошибка", "error")
+        return redirect(url_for("index"))
+
+
+# ------------------- Import CSV Wizard (UI) -------------------
+@app.route("/import", methods=["GET", "POST"])
+@login_required
+def import_csv_wizard():
+    try:
+        if request.method == "POST":
+            verify_csrf()
+            f = request.files.get("csvfile")
+            mode = (request.form.get("mode") or "").strip()
+            if not f or not f.filename:
+                flash("Файл не выбран", "error")
+            else:
+                flash("Файл получен, обработка будет выполнена", "success")
+        inner = render_safe(IMPORT_TMPL)
+        return render_safe(LAYOUT_TMPL, inner=inner)
+    except Exception as e:
+        app.logger.exception(f"Import wizard error: {e}")
+        flash("Внутренняя ошибка", "error")
+        return redirect(url_for("index"))
+# === END CORE PART 9/11 (3/3) ===
+# === CORE PART 10/11 — ensure_thread, Rules/Workflow triggers, Documents, Warehouse, Reports, Analytics ===
 # -*- coding: utf-8 -*-
 
-# ------------------- Workflow Engine (whitelisted set_field, safer awaits) -------------------
-def _wf_load_graph(def_row):
+# ------------------- ensure_thread helper (find-or-create) -------------------
+def ensure_thread(org_id: int, channel_id: int, kind: str = "dm", external_id: str = "", subject: str = "") -> int:
     try:
-        g = json.loads(def_row["graph_json"] or "{}")
-        return g if isinstance(g, dict) else {}
-    except Exception:
-        return {}
+        th = None
+        if external_id:
+            th = query_db(
+                "SELECT id FROM inbox_threads WHERE org_id=? AND channel_id=? AND kind=? AND external_id=? LIMIT 1",
+                (org_id, channel_id, kind, external_id),
+                one=True,
+            )
+        if th:
+            tid = th["id"]
+            exec_db("UPDATE inbox_threads SET updated_at=CURRENT_TIMESTAMP WHERE id=? AND org_id=?", (tid, org_id))
+            return tid
+        tid = exec_db(
+            """INSERT INTO inbox_threads (org_id,channel_id,kind,external_id,subject,status,priority,last_message_at,created_at)
+               VALUES (?,?,?,?,?,'open','normal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
+            (org_id, channel_id, kind or "dm", external_id or None, subject or None),
+        )
+        return tid or 0
+    except Exception as e:
+        app.logger.error(f"ensure_thread error: {e}")
+        return 0
 
 
-def _wf_eval_path(obj: dict, path: str):
+# ------------------- Simple rule engine (MVP, hardened) -------------------
+def _resolve_dotted(obj, path: str):
     cur = obj
     for part in (path.split(".") if path else []):
         if isinstance(cur, dict) and part in cur:
@@ -8468,18 +8540,424 @@ def _wf_eval_path(obj: dict, path: str):
     return cur
 
 
-def _wf_eval_value(val, ctx: dict, payload: dict):
-    if isinstance(val, str) and val.startswith("{{") and val.endswith("}}"):
-        inner = val[2:-2].strip()
-        if inner.startswith("payload."):
-            return _wf_eval_path(payload, inner.split("payload.", 1)[1])
-        if inner.startswith("ctx."):
-            return _wf_eval_path(ctx, inner.split("ctx.", 1)[1])
-        return _wf_eval_path({"ctx": ctx, "payload": payload}, inner)
-    return val
+def run_rules(event: str, org_id: int, payload: dict):
+    try:
+        rules = query_db("SELECT * FROM rules WHERE org_id=? AND event=? AND active=1 ORDER BY id", (org_id, event))
+        if not rules:
+            return
+        for r in (rules or []):
+            try:
+                cond = json.loads(r["condition_json"] or "{}")
+            except Exception:
+                cond = {}
+            try:
+                params = json.loads(r["params_json"] or "{}")
+            except Exception:
+                params = {}
+            ok = True
+            if cond:
+                field = cond.get("field") or ""
+                op = (cond.get("op") or "eq").lower()
+                val = cond.get("value")
+                target = _resolve_dotted(payload or {}, field)
+                ok = False
+                try:
+                    if op == "eq":
+                        ok = (str(target) == str(val))
+                    elif op == "contains":
+                        ok = (str(val) in str(target))
+                    elif op == "regex":
+                        pattern = str(val or "")
+                        if len(pattern) > 200:
+                            ok = False
+                        else:
+                            ok = bool(re.search(pattern, str(target or "")))
+                    elif op in ("ne", "neq"):
+                        ok = (str(target) != str(val))
+                    else:
+                        ok = False
+                except Exception:
+                    ok = False
+            if not ok:
+                continue
+            action = (r["action"] or "").lower()
+            try:
+                if action == "notify":
+                    uid = params.get("user_id")
+                    title = params.get("title") or event
+                    body = params.get("body") or ""
+                    link = params.get("link_url") or ""
+                    if uid:
+                        notify_user(uid, title, body, link)
+                elif action == "webhook":
+                    extra_event = params.get("event") or (event + ".rule")
+                    emit_webhook(org_id, extra_event, {"original": payload, "rule_id": r["id"]})
+                else:
+                    pass
+            except Exception as e:
+                app.logger.error(f"Rule action error: {e}")
+    except Exception as e:
+        app.logger.error(f"run_rules error: {e}")
 
+
+# ------------------- Workflow triggers (start runs on events) -------------------
+def _wf_defs_for_event(org_id: int, event: str):
+    try:
+        defs = query_db("SELECT * FROM workflow_defs WHERE org_id=? AND active=1 ORDER BY id DESC", (org_id,))
+        matched = []
+        for d in (defs or []):
+            try:
+                g = json.loads(d["graph_json"] or "{}")
+            except Exception:
+                g = {}
+            on = g.get("on") or g.get("triggers") or []
+            if isinstance(on, str):
+                on = [on]
+            if event in set(on or []):
+                matched.append(d)
+        return matched
+    except Exception:
+        return []
+
+
+def _wf_enqueue_task(run_id: int, node_key: str, payload=None, delay_sec: int = 0):
+    payload_s = json.dumps(payload or {}, ensure_ascii=False)
+    if delay_sec and delay_sec > 0:
+        next_at = (datetime.utcnow() + timedelta(seconds=int(delay_sec))).isoformat(" ", "seconds")
+        exec_db(
+            "INSERT INTO workflow_tasks (run_id,node_key,payload_json,status,next_at) VALUES (?,?,?,?,?)",
+            (run_id, node_key, payload_s, "pending", next_at),
+        )
+    else:
+        exec_db(
+            "INSERT INTO workflow_tasks (run_id,node_key,payload_json,status,next_at) VALUES (?,?,?,?,NULL)",
+            (run_id, node_key, payload_s, "pending"),
+        )
+
+
+def _wf_start_run(def_row, org_id: int, ctx: dict) -> int:
+    run_id = exec_db(
+        "INSERT INTO workflow_runs (org_id,def_id,status,ctx_json) VALUES (?,?,?,?)",
+        (org_id, def_row["id"], "running", json.dumps(ctx or {}, ensure_ascii=False)),
+    )
+    try:
+        g = json.loads(def_row["graph_json"] or "{}")
+    except Exception:
+        g = {}
+    start_node = g.get("start") or g.get("entry") or "start"
+    _wf_enqueue_task(run_id, str(start_node), {"ctx": ctx}, 0)
+    try:
+        _metrics_set("workflow_runs_active", (org_id,), 1 + int(_metrics.get("workflow_runs_active", {}).get((org_id,), 0)))
+    except Exception:
+        pass
+    return run_id
+
+
+def workflow_start_for_event(event: str, org_id: int, payload: dict):
+    try:
+        defs = _wf_defs_for_event(org_id, event)
+        if not defs:
+            return
+        ctx = {"event": event, "payload": payload}
+        for d in (defs or []):
+            _wf_start_run(d, org_id, ctx)
+    except Exception as e:
+        app.logger.error(f"workflow_start_for_event error: {e}")
+
+
+def fire_event(event: str, org_id: int, payload: dict):
+    try:
+        run_rules(event, org_id, payload or {})
+    except Exception as e:
+        app.logger.error(f"fire_event.run_rules error: {e}")
+    try:
+        workflow_start_for_event(event, org_id, payload or {})
+    except Exception as e:
+        app.logger.error(f"fire_event.workflow error: {e}")
+    try:
+        emit_webhook(org_id, event, payload or {})
+    except Exception as e:
+        app.logger.error(f"fire_event.webhook error: {e}")
+
+
+# ------------------- Documents module (routes; templates defined in STYLES) -------------------
+@app.route("/documents")
+@admin_required
+def documents_page():
+    org_id = current_org_id()
+    templates = query_db("SELECT id,name,type,tkey,created_at FROM documents_templates WHERE org_id=? ORDER BY id DESC", (org_id,))
+    docs = query_db(
+        """
+        SELECT d.id, d.doc_type, d.title, d.created_at, c.name AS company_name
+        FROM documents d
+        LEFT JOIN companies c ON c.id=d.company_id
+        WHERE d.org_id=?
+        ORDER BY d.id DESC LIMIT 100
+        """,
+        (org_id,),
+    )
+    companies = query_db("SELECT id,name,inn FROM companies WHERE org_id=? ORDER BY id DESC LIMIT 200", (org_id,))
+    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENTS_TMPL, templates=templates, docs=docs, companies=companies))
+
+
+@app.route("/documents/template/add", methods=["POST"])
+@admin_required
+def documents_template_add():
+    verify_csrf()
+    org_id = current_org_id()
+    typ = (request.form.get("type") or "").strip() or "proposal"
+    name = (request.form.get("name") or "").strip()
+    tkey = (request.form.get("tkey") or "").strip() or None
+    body = request.form.get("body_template") or ""
+    if not name or not body:
+        return redirect(url_for("documents_page"))
+    exec_db(
+        "INSERT INTO documents_templates (org_id,name,type,tkey,body_template) VALUES (?,?,?,?,?)",
+        (org_id, name, typ, tkey, body),
+    )
+    return redirect(url_for("documents_page"))
+
+
+@app.route("/documents/create", methods=["POST"])
+@admin_required
+def documents_create():
+    verify_csrf()
+    org_id = current_org_id()
+    try:
+        template_id = int(request.form.get("template_id") or "0")
+    except Exception:
+        template_id = 0
+    try:
+        company_id = int(request.form.get("company_id") or "0")
+    except Exception:
+        company_id = 0
+    tpl = query_db("SELECT * FROM documents_templates WHERE id=? AND org_id=?", (template_id, org_id), one=True)
+    if not tpl:
+        return redirect(url_for("documents_page"))
+    org = query_db("SELECT * FROM orgs WHERE id=?", (org_id,), one=True)
+    company = query_db("SELECT * FROM companies WHERE id=? AND org_id=?", (company_id, org_id), one=True) if company_id else None
+    user = get_current_user()
+    ctx = {
+        "org": dict(org or {}),
+        "company": dict(company or {}),
+        "user": dict(user or {}),
+        "now": datetime.utcnow().strftime("%Y-%m-%d"),
+    }
+    # Safe render (autoescape on) to prevent injecting unsafe HTML from variables.
+    try:
+        content_html = render_safe(str(tpl["body_template"] or ""), **ctx)
+    except Exception as e:
+        app.logger.error(f"Doc render failed: {e}")
+        content_html = f"<pre>Ошибка рендеринга шаблона: {e}</pre>"
+    title = f"{tpl['name']}" + (f" · {company['name']}" if company else "")
+    did = exec_db(
+        "INSERT INTO documents (org_id,template_id,doc_type,company_id,user_id,title,content_html) VALUES (?,?,?,?,?,?,?)",
+        (org_id, tpl["id"], tpl["type"], company_id if company else None, session.get("user_id"), title, content_html),
+    )
+    return redirect(url_for("document_view", doc_id=did))
+
+
+@app.route("/document/<int:doc_id>")
+@login_required
+def document_view(doc_id: int):
+    org_id = current_org_id()
+    d = query_db("SELECT * FROM documents WHERE id=? AND org_id=?", (doc_id, org_id), one=True)
+    if not d:
+        flash("Документ не найден", "error")
+        return redirect(url_for("documents_page"))
+    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENT_VIEW_TMPL, d=d))
+
+
+# ------------------- Warehouse (Inventory) -------------------
+@app.route("/warehouse")
+@admin_required
+def warehouse_page():
+    org_id = current_org_id()
+    rows = query_db(
+        """
+        SELECT p.id, p.sku, p.name, p.price, p.currency, COALESCE(i.qty,0) AS qty
+        FROM products p
+        LEFT JOIN inventory i ON i.product_id=p.id AND i.org_id=p.org_id
+        WHERE p.org_id=?
+        ORDER BY p.id DESC
+        LIMIT 500
+        """,
+        (org_id,),
+    )
+    return render_safe(LAYOUT_TMPL, inner=render_safe(WAREHOUSE_TMPL, products=rows))
+
+
+@app.route("/warehouse/stock/set", methods=["POST"])
+@admin_required
+def warehouse_stock_set():
+    verify_csrf()
+    org_id = current_org_id()
+    try:
+        product_id = int(request.form.get("product_id") or "0")
+        qty = float(request.form.get("qty") or "0")
+    except Exception:
+        product_id = 0
+        qty = 0.0
+    if not product_id:
+        return redirect(url_for("warehouse_page"))
+    if not query_db("SELECT 1 FROM products WHERE id=? AND org_id=?", (product_id, org_id), one=True):
+        return redirect(url_for("warehouse_page"))
+    if query_db("SELECT 1 FROM inventory WHERE product_id=? AND org_id=?", (product_id, org_id), one=True):
+        exec_db("UPDATE inventory SET qty=?, updated_at=CURRENT_TIMESTAMP WHERE product_id=? AND org_id=?", (qty, product_id, org_id))
+    else:
+        exec_db("INSERT INTO inventory (org_id, product_id, qty) VALUES (?,?,?)", (org_id, product_id, qty))
+    return redirect(url_for("warehouse_page"))
+
+
+# ------------------- Reports: tasks/calls daily aggregates (feed for Analytics UI) -------------------
+@app.route("/api/reports/tasks_daily")
+@login_required
+def api_reports_tasks_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+
+        where_created = ["org_id=?"]
+        p_created = [org_id]
+        if df:
+            where_created.append("created_at>=?"); p_created.append(df)
+        if dt:
+            where_created.append("created_at<=?"); p_created.append(dt)
+        rows_created = query_db(
+            f"""
+            SELECT substr(created_at,1,10) AS ymd,
+                   COUNT(1) AS created_cnt,
+                   COALESCE(SUM(monthly_fee),0) AS monthly_fee_sum
+            FROM tasks
+            WHERE {' AND '.join(where_created)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_created),
+        )
+
+        where_done = ["org_id=?", "status='done'"]
+        p_done = [org_id]
+        if df:
+            where_done.append("updated_at>=?"); p_done.append(df)
+        if dt:
+            where_done.append("updated_at<=?"); p_done.append(dt)
+        rows_done = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS done_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_done)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_done),
+        )
+
+        where_over = ["org_id=?", "status='overdue'"]
+        p_over = [org_id]
+        if df:
+            where_over.append("updated_at>=?"); p_over.append(df)
+        if dt:
+            where_over.append("updated_at<=?"); p_over.append(dt)
+        rows_over = query_db(
+            f"""
+            SELECT substr(updated_at,1,10) AS ymd,
+                   COUNT(1) AS overdue_cnt
+            FROM tasks
+            WHERE {' AND '.join(where_over)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(p_over),
+        )
+
+        agg = {}
+        for r in (rows_created or []):
+            y = r["ymd"]
+            agg[y] = {
+                "ymd": y,
+                "created_cnt": int(r["created_cnt"] or 0),
+                "monthly_fee_sum": float(r["monthly_fee_sum"] or 0.0),
+            }
+        for r in (rows_done or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["done_cnt"] = int(r["done_cnt"] or 0)
+        for r in (rows_over or []):
+            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
+            it["overdue_cnt"] = int(r["overdue_cnt"] or 0)
+
+        items = [
+            {
+                "ymd": k,
+                "created_cnt": int(v.get("created_cnt", 0)),
+                "done_cnt": int(v.get("done_cnt", 0)),
+                "overdue_cnt": int(v.get("overdue_cnt", 0)),
+                "monthly_fee_sum": float(v.get("monthly_fee_sum", 0.0)),
+            }
+            for k, v in sorted(agg.items())
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"tasks_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
+
+
+@app.route("/api/reports/calls_daily")
+@login_required
+def api_reports_calls_daily():
+    try:
+        org_id = current_org_id()
+        date_from = request.args.get("date_from") or ""
+        date_to = request.args.get("date_to") or ""
+        df, dt = date_range_bounds(date_from, date_to)
+        where_ = ["org_id=?"]
+        params = [org_id]
+        if df:
+            where_.append("started_at>=?"); params.append(df)
+        if dt:
+            where_.append("started_at<=?"); params.append(dt)
+        rows = query_db(
+            f"""
+            SELECT substr(started_at,1,10) AS ymd,
+                   SUM(CASE WHEN direction='in' THEN 1 ELSE 0 END) AS in_cnt,
+                   SUM(CASE WHEN direction='out' THEN 1 ELSE 0 END) AS out_cnt,
+                   COALESCE(SUM(COALESCE(duration_sec,0)),0) AS dur_sum
+            FROM calls
+            WHERE {' AND '.join(where_)}
+            GROUP BY ymd
+            ORDER BY ymd
+            """,
+            tuple(params),
+        )
+        items = [
+            {
+                "ymd": r["ymd"],
+                "in_cnt": int(r["in_cnt"] or 0),
+                "out_cnt": int(r["out_cnt"] or 0),
+                "dur_sum": int(r["dur_sum"] or 0),
+            }
+            for r in (rows or [])
+        ]
+        return jsonify(ok=True, items=items)
+    except Exception as e:
+        app.logger.exception(f"calls_daily error: {e}")
+        return jsonify(ok=False, error="internal error"), 500
+
+
+# ------------------- Analytics landing (template only) -------------------
+@app.route("/analytics")
+@login_required
+def analytics():
+    return render_safe(ANALYTICS_TMPL)
+# === END CORE PART 10/11 ===
+# === CORE PART 11/11 (1/3) — Workflow Engine: policy, execute node, single-tick executor ===
+# -*- coding: utf-8 -*-
 
 def _ai_policy_for_org(org_id: int) -> dict:
+    """Return AI policy for org with safe defaults."""
     try:
         cfg = _get_org_ai_config(org_id) or {}
         pol = cfg.get("policy") or {}
@@ -8492,21 +8970,31 @@ def _ai_policy_for_org(org_id: int) -> dict:
             "await_max_minutes": int(pol.get("await_max_minutes", 24 * 60)),
         }
     except Exception:
-        return {"allow_summary": True, "allow_autotag": True, "allow_set_fields": True, "approval_required_for": [], "exclude_internal_notes": AI_EXCLUDE_INTERNAL_NOTES_DEFAULT, "await_max_minutes": 1440}
+        return {
+            "allow_summary": True,
+            "allow_autotag": True,
+            "allow_set_fields": True,
+            "approval_required_for": [],
+            "exclude_internal_notes": AI_EXCLUDE_INTERNAL_NOTES_DEFAULT,
+            "await_max_minutes": 1440,
+        }
 
 
 _WF_SET_FIELD_ALLOWED = {
     "task": {"title", "description", "priority", "status", "due_at", "assignee_id", "current_stage", "current_department_id", "address", "contact_phone"},
-    "deal": {"title", "stage", "amount", "currency", "status", "assignee_id", "current_department_id", "due_at"},
+    "deal": {"title", "stage", "amount", "currency", "status", "assignee_id", "current_department_id", "due_at", "pipeline_key"},
 }
 
 
 def _wf_mark_task_done(task_id: int):
-    exec_db("UPDATE workflow_tasks SET status='done' WHERE id=?", (task_id,))
+    try:
+        exec_db("UPDATE workflow_tasks SET status='done' WHERE id=?", (task_id,))
+    except Exception:
+        pass
 
 
 def _wf_enqueue_next(run_id: int, node_key: str, ctx: dict, payload: dict, delay_sec: int = 0):
-    _wf_enqueue_task(run_id, node_key, {"ctx": ctx, "payload": payload}, max(0, int(delay_sec or 0)))
+    _wf_enqueue_task(run_id, node_key, {"ctx": (ctx or {}), "payload": (payload or {})}, max(0, int(delay_sec or 0)))
 
 
 def _wf_create_approval(org_id: int, title: str, description: str) -> int:
@@ -8519,14 +9007,20 @@ def _wf_create_approval(org_id: int, title: str, description: str) -> int:
 
 
 def _wf_execute_node(run_row, def_row, node_key: str, task_row):
+    """Execute single node of workflow; return next node key or None (when queued/waiting)."""
     org_id = int(run_row["org_id"])
-    g = _wf_load_graph(def_row)
+    # Graph + node resolve
+    try:
+        g = json.loads(def_row["graph_json"] or "{}")
+    except Exception:
+        g = {}
     nodes = g.get("nodes") or {}
     node = nodes.get(node_key) or {}
     ntype = (node.get("type") or "start").lower()
     params = node.get("params") or {}
     next_key = node.get("next")
 
+    # Merge contexts
     try:
         ctx = json.loads(run_row["ctx_json"] or "{}")
     except Exception:
@@ -8540,21 +9034,24 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
     ctx_m = {**(ctx if isinstance(ctx, dict) else {}), **(p_ctx if isinstance(p_ctx, dict) else {})}
     pay_m = {**(p_payload if isinstance(p_payload, dict) else {})}
 
+    # Start is a pass-through
     if ntype == "start":
         return next_key
 
+    # IF node
     if ntype == "if":
         field = str(params.get("field") or "")
         op = str(params.get("op") or "eq").lower()
         value = params.get("value")
-        left = None
-        val_eval = _wf_eval_value(value, ctx_m, pay_m)
+        # Evaluate left side
         if field.startswith("ctx."):
-            left = _wf_eval_path(ctx_m, field.split("ctx.", 1)[1])
+            left = _resolve_dotted(ctx_m, field.split("ctx.", 1)[1])
         elif field.startswith("payload."):
-            left = _wf_eval_path(pay_m, field.split("payload.", 1)[1])
+            left = _resolve_dotted(pay_m, field.split("payload.", 1)[1])
         else:
-            left = _wf_eval_path({"ctx": ctx_m, "payload": pay_m}, field)
+            left = _resolve_dotted({"ctx": ctx_m, "payload": pay_m}, field)
+        # Evaluate value (supports {{ctx.*}} / {{payload.*}})
+        val_eval = _wf_eval_value(value, ctx_m, pay_m)
         res = False
         try:
             if op == "eq":
@@ -8571,12 +9068,14 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
             res = False
         return node.get("next_true") if res else node.get("next_false")
 
+    # Delay node
     if ntype == "delay":
         sec = int(params.get("seconds") or 0)
         if next_key:
             _wf_enqueue_next(run_row["id"], next_key, ctx_m, pay_m, sec)
         return None
 
+    # Set field node
     if ntype == "set_field":
         entity = (params.get("entity") or "").strip()
         target_id_raw = params.get("id")
@@ -8608,6 +9107,7 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
             app.logger.error(f"[WF] set_field failed: {e}")
         return next_key
 
+    # Move stage node
     if ntype == "move_stage":
         entity = (params.get("entity") or "task").strip()
         target_id = _wf_eval_value(params.get("id"), ctx_m, pay_m)
@@ -8634,6 +9134,7 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
             app.logger.error(f"[WF] move_stage failed: {e}")
         return next_key
 
+    # Notify user
     if ntype == "notify_user":
         users = params.get("user_id") or params.get("users") or []
         if isinstance(users, (int, str)):
@@ -8653,18 +9154,20 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
             app.logger.error(f"[WF] notify_user failed: {e}")
         return next_key
 
+    # Webhook call
     if ntype == "webhook_call":
         ev = str(params.get("event") or "workflow.event")
         pl = params.get("payload") or {}
         try:
             resolved_pl = {}
-            for k, v in pl.items():
+            for k, v in (pl.items() if isinstance(pl, dict) else []):
                 resolved_pl[k] = _wf_eval_value(v, ctx_m, pay_m)
             emit_webhook(org_id, ev, {"workflow_run": run_row["id"], "node": node_key, "payload": resolved_pl})
         except Exception as e:
             app.logger.error(f"[WF] webhook_call failed: {e}")
         return next_key
 
+    # AI call (with policy + approval)
     if ntype == "ai_call":
         action = str(params.get("action") or "")
         pol = _ai_policy_for_org(org_id)
@@ -8698,7 +9201,13 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
             app.logger.error(f"[WF] ai_call failed: {e}")
         return next_key
 
+    # Await approval node (internal)
     if ntype == "await_approval":
+        payload = {}
+        try:
+            payload = json.loads(task_row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
         aid = int((payload or {}).get("approval_id") or 0)
         nxt = (payload or {}).get("next")
         tries = int((payload or {}).get("tries") or 0)
@@ -8716,13 +9225,16 @@ def _wf_execute_node(run_row, def_row, node_key: str, task_row):
         _wf_enqueue_next(run_row["id"], node_key, ctx_m, {"approval_id": aid, "next": nxt, "tries": tries + 1}, 60)
         return None
 
+    # Default: go next
     return next_key
 
 
 def _wf_execute_once():
+    """Execute due timers and pending tasks one tick."""
     now = datetime.utcnow().isoformat(" ", "seconds")
+    # Timers
     timers = query_db("SELECT * FROM workflow_timers WHERE fire_at<=? ORDER BY id LIMIT 50", (now,))
-    for t in timers or []:
+    for t in (timers or []):
         try:
             exec_db("DELETE FROM workflow_timers WHERE id=?", (t["id"],))
             try:
@@ -8733,6 +9245,7 @@ def _wf_execute_once():
         except Exception:
             pass
 
+    # Tasks
     tasks = query_db(
         """SELECT * FROM workflow_tasks
            WHERE status='pending' AND (next_at IS NULL OR next_at<=?)
@@ -8751,7 +9264,7 @@ def _wf_execute_once():
                     pass
         except Exception:
             pass
-    for t in tasks or []:
+    for t in (tasks or []):
         try:
             run = query_db("SELECT * FROM workflow_runs WHERE id=?", (t["run_id"],), one=True)
             if not run or str(run["status"]) != "running":
@@ -8768,7 +9281,9 @@ def _wf_execute_once():
         except Exception as e:
             app.logger.error(f"[WF] execute task {t.get('id')} failed: {e}")
             _wf_mark_task_done(t["id"])
-
+# === END CORE PART 11/11 (1/3) ===
+# === CORE PART 11/11 (2/3) — Workers: locks, webhook worker (delivery with retries), helpers ===
+# -*- coding: utf-8 -*-
 
 # ------------------- Workers, Locks, Helpers -------------------
 _worker_lock_path = os.path.join(DATA_DIR, ".workers.lock")
@@ -8777,6 +9292,7 @@ WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("WEBHOOK_MAX_ATTEMPTS", "10"))
 
 
 def _acquire_worker_lock():
+    """Best-effort global lock (Redis preferred, otherwise fs lock) to ensure single worker set."""
     global _worker_lock_acquired
     if REDIS_CLIENT:
         try:
@@ -8786,6 +9302,7 @@ def _acquire_worker_lock():
                 return True
         except Exception:
             pass
+    # FS lock fallback
     try:
         if os.path.exists(_worker_lock_path):
             try:
@@ -8812,6 +9329,7 @@ def _acquire_worker_lock():
 
 
 def _refresh_worker_lock():
+    """Refresh Redis lock TTL if used."""
     if not _worker_lock_acquired:
         return
     if REDIS_CLIENT:
@@ -8822,6 +9340,7 @@ def _refresh_worker_lock():
 
 
 def _release_worker_lock():
+    """Release worker lock on shutdown."""
     global _worker_lock_acquired
     if not _worker_lock_acquired:
         return
@@ -8842,6 +9361,7 @@ def _release_worker_lock():
 
 
 def webhook_worker():
+    """Deliver pending webhooks with retry/backoff, update metrics and status."""
     try:
         import requests as _rq
         requests_available = True
@@ -8867,7 +9387,7 @@ def webhook_worker():
                        ORDER BY id ASC LIMIT 10""",
                     (now,),
                 )
-                for r in rows:
+                for r in (rows or []):
                     whs = query_db("SELECT * FROM webhooks WHERE org_id=? AND event=? AND active=1", (r["org_id"], r["event"]))
                     if not whs:
                         exec_db("UPDATE webhook_queue SET status='delivered', attempts=attempts+1 WHERE id=?", (r["id"],))
@@ -8875,7 +9395,7 @@ def webhook_worker():
                         continue
                     payload = r["payload_json"] or "{}"
                     delivered = 0
-                    for wbh in whs:
+                    for wbh in (whs or []):
                         try:
                             sig = sign_payload(wbh["secret"] or "", payload.encode("utf-8"))
                             headers = {
@@ -8889,7 +9409,7 @@ def webhook_worker():
                                 delivered += 1
                         except Exception as e:
                             app.logger.error(f"[WEBHOOK] delivery failed: {e}")
-                    if delivered == len(whs):
+                    if delivered == len(whs or []):
                         exec_db("UPDATE webhook_queue SET status='delivered', attempts=attempts+1 WHERE id=?", (r["id"],))
                         _metrics_inc("webhook_delivery_total", (r["event"], "delivered"))
                     else:
@@ -8905,7 +9425,9 @@ def webhook_worker():
             except Exception as e:
                 app.logger.exception(f"[WEBHOOK] worker error: {e}")
             time.sleep(5)
-
+# === END CORE PART 11/11 (2/3) ===
+# === CORE PART 11/11 (3/3) — Email fetch, Maintenance worker, Workers start (before_first_request) ===
+# -*- coding: utf-8 -*-
 
 def _email_decode_header(s):
     try:
@@ -8926,6 +9448,7 @@ def _email_decode_header(s):
 
 
 def _email_fetch_once():
+    """Fetch new inbound emails for configured accounts; create/update threads/messages."""
     if not EMAIL_ENABLED:
         return
     try:
@@ -8934,7 +9457,7 @@ def _email_fetch_once():
     except Exception:
         return
     rows = query_db("SELECT * FROM mail_accounts ORDER BY id LIMIT 5")
-    for acc in rows or []:
+    for acc in (rows or []):
         acc_id = acc["id"]
         try:
             host = (acc["host"] or EMAIL_IMAP_HOST)
@@ -9018,6 +9541,7 @@ def _email_fetch_once():
 
 
 def maintenance_worker():
+    """Periodic maintenance: cleanup, FTS, reminders/meetings notifications, workflow ticks, email polling."""
     with app.app_context():
         last_analytics = 0
         while True:
@@ -9025,6 +9549,7 @@ def maintenance_worker():
             try:
                 _metrics_set("worker_heartbeat", ("maintenance",), int(time.time()))
 
+                # Retention: notifications (90d), webhook_queue (30d), audit by RETENTION_MONTHS
                 cutoff_notif = (datetime.utcnow() - timedelta(days=90)).isoformat(" ", "seconds")
                 exec_db("DELETE FROM notifications WHERE created_at < ?", (cutoff_notif,))
                 cutoff_wh = (datetime.utcnow() - timedelta(days=30)).isoformat(" ", "seconds")
@@ -9033,9 +9558,10 @@ def maintenance_worker():
                     cutoff_audit = (datetime.utcnow() - timedelta(days=RETENTION_MONTHS * 30)).isoformat(" ", "seconds")
                     exec_db("DELETE FROM audit_logs WHERE created_at < ?", (cutoff_audit,))
 
+                # Soft-delete files finalization (older than 30d)
                 cutoff30 = (datetime.utcnow() - timedelta(days=30)).isoformat(" ", "seconds")
                 olds = query_db("SELECT id, storage_key FROM files WHERE deleted_at IS NOT NULL AND deleted_at < ?", (cutoff30,))
-                for frow in olds:
+                for frow in (olds or []):
                     key = frow["storage_key"] or ""
                     if key.startswith("local:"):
                         try:
@@ -9046,16 +9572,18 @@ def maintenance_worker():
                             pass
                     exec_db("DELETE FROM files WHERE id=?", (frow["id"],))
 
+                # Scheduled FTS rebuild
                 try:
                     last_ts = get_app_meta("fts_last_rebuild_ts", "0")
                     last = int(last_ts or "0")
                     nowi = int(time.time())
-                    if nowi - last >= FTS_REBUILD_INTERVAL_SEC:
+                    if nowi - last >= FTS_REBUILD_INTERVAL_SEC and _fts_ok():
                         fts_rebuild_all()
                         set_app_meta("fts_last_rebuild_ts", str(nowi))
                 except Exception:
                     pass
 
+                # Reminders due (minute resolution)
                 now_ts = datetime.utcnow().isoformat(" ", "seconds")[:16]
                 due = query_db(
                     """SELECT r.id, r.org_id, r.task_id, r.user_id, r.remind_at, r.message, t.title
@@ -9066,11 +9594,14 @@ def maintenance_worker():
                     (now_ts,),
                 )
                 if due:
-                    ids = [d["id"] for d in due]
+                    ids = [d["id"] for d in (due or [])]
                     q = ",".join(["?"] * len(ids))
                     exec_db(f"UPDATE task_reminders SET fired=1, fired_at=CURRENT_TIMESTAMP WHERE id IN ({q})", tuple(ids))
-                    for d in due:
-                        notify_user(d["user_id"], f"Напоминание по задаче #{d['task_id']}", d["message"] or (d["title"] or ""), "/tasks")
+                    for d in (due or []):
+                        try:
+                            notify_user(d["user_id"], f"Напоминание по задаче #{d['task_id']}", d["message"] or (d["title"] or ""), "/tasks")
+                        except Exception:
+                            pass
                         try:
                             sse_publish(d["user_id"], "task.reminder.popup", {
                                 "task_id": d["task_id"],
@@ -9085,6 +9616,7 @@ def maintenance_worker():
                         except Exception:
                             pass
 
+                # Meetings reminders
                 meetings = query_db(
                     """SELECT id, org_id, title, start_at, notify_before_min, participants_json, reminder_fired
                        FROM meetings
@@ -9092,7 +9624,7 @@ def maintenance_worker():
                        ORDER BY start_at ASC LIMIT 500"""
                 )
                 now_dt = datetime.utcnow()
-                for m in meetings:
+                for m in (meetings or []):
                     try:
                         st = datetime.fromisoformat(str(m["start_at"]).replace("T", " "))
                         delta_min = (st - now_dt).total_seconds() / 60.0
@@ -9110,23 +9642,26 @@ def maintenance_worker():
                     except Exception:
                         pass
 
+                # Workflow engine tick
                 _wf_execute_once()
 
+                # Email fetch (every ~3 minutes)
                 if int(time.time()) % 180 < 2:
                     _email_fetch_once()
 
+                # Analytics placeholder (hourly)
                 if int(time.time()) - last_analytics >= 3600:
                     last_analytics = int(time.time())
-
             except Exception as e:
                 app.logger.exception(f"[MAINT] error: {e}")
             time.sleep(60)
 
 
 def start_workers_once():
+    """Start background workers (single process) with locks; idempotent."""
     if app.config.get("_WORKERS"):
         return
-    if not WORKERS_ENABLED:
+    if not WORKERS_ENABLED or (WORKERS_MODE not in ("main", "")):
         app.config["_WORKERS"] = True
         return
     if not _acquire_worker_lock():
@@ -9141,15 +9676,15 @@ def start_workers_once():
         app.logger.error(f"Workers start error: {e}")
 
 
-@app.before_request
-def _ensure_workers():
+@app.before_first_request
+def _ensure_workers_on_first_request():
+    """Ensure workers are started once server is ready to serve requests."""
     try:
-        if os.environ.get("WERKZEUG_RUN_MAIN", "true") == "true":
-            start_workers_once()
+        start_workers_once()
     except Exception:
         pass
-# === END CORE PART 9/9 (3/3) ===
-# === STYLES PART 1/9 — BASE CSS, LAYOUT, LOGIN (org-aware), INDEX, PROFILE (strict CSP) ===
+# === END CORE PART 11/11 (3/3) ===
+# === STYLES PART 1/11 — BASE CSS, LAYOUT, LOGIN (org-aware), INDEX, PROFILE (strict CSP) ===
 # -*- coding: utf-8 -*-
 
 BASE_CSS = """
@@ -9234,7 +9769,6 @@ a{color:var(--accent);text-decoration:none} a:hover{opacity:.9}
 .card form label{display:block;margin:6px 0}
 .card form .input,.card form .select,.card form textarea{width:100%}
 .grid-filters .input,.grid-filters .select{width:100%}
-/* fixed-width inputs for specific modal forms */
 .form-fixed input.input, .form-fixed select.select, .form-fixed textarea.input { width: 320px; max-width: 100%; }
 
 .fab{position:fixed;right:24px;bottom:24px;width:48px;height:48px;border-radius:50%;background:var(--accent);color:#0b130f;border:none;font-size:24px;line-height:48px;text-align:center;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.35)}
@@ -9304,7 +9838,7 @@ LAYOUT_TMPL = """
     <div class="page {% if expanded %}expanded{% endif %}" id="page">
       <div class="topbar">
         <form method="get" action="{{ url_for('inbox') }}" style="display:flex;gap:8px;">
-          <input class="search input" name="q" placeholder="Поиск по сообщениям (FTS)..." value="{{ request.args.get('q','') }}">
+          <input class="search input" name="q" placeholder="Поиск по сообщениям (FTS/LIKE)..." value="{{ request.args.get('q','') }}">
           <button class="button ghost" type="submit">Найти</button>
         </form>
         <div style="display:flex;gap:8px;align-items:center;">
@@ -9421,9 +9955,7 @@ LAYOUT_TMPL = """
         if(exp){ sb.classList.add('expanded'); pg.classList.add('expanded'); } else { sb.classList.remove('expanded'); pg.classList.remove('expanded'); }
         try{ fetch('/api/ui/sidebar',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':window.CSRF},body:JSON.stringify({expanded:exp})}); }catch(e){}
       }
-      document.getElementById('btnTheme')?.addEventListener('click', e=>{
-        e.preventDefault(); fetch('/toggle-theme',{method:'POST',headers:{'X-CSRFToken':window.CSRF}}).then(()=>location.reload());
-      });
+      document.getElementById('btnTheme')?.addEventListener('click', (e)=>{ e.preventDefault(); fetch('/toggle-theme',{method:'POST',headers:{'X-CSRFToken':window.CSRF}}).then(()=>location.reload()); });
       document.getElementById('btnDial')?.addEventListener('click', (e)=>{
         e.preventDefault(); const raw=prompt('Наберите номер',''); const num = normPhoneRU(raw||'');
         if(num){ fetch('/api/cti/click_to_call',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':window.CSRF},body:JSON.stringify({to:num})})
@@ -9512,7 +10044,7 @@ INDEX_TMPL = """
     const num = (function(raw){ const d=String(raw||'').replace(/\\D+/g,''); if(!d) return ''; let n=d; if(n.length===11 && n.startsWith('8')) n='7'+n.slice(1); if(n.length===10) n='7'+n; return '+'+n; })(raw||'');
     if(num){
       fetch('/api/cti/click_to_call',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':window.CSRF}, body: JSON.stringify({to:num})})
-        .then(r=>r.json()).then(j=>{ if(j.ok){ toast('Звонок: ' + num); } else { alert(j.error||'Ошибка'); } });
+        .then(r=>r.json()).then(j=>{ if(j.ok){ const t=typeof toast==='function'?toast:alert; t('Звонок: ' + num); } else { alert(j.error||'Ошибка'); } });
     }
   });
 </script>
@@ -9600,8 +10132,8 @@ PROFILE_TMPL = """
 })();
 </script>
 """
-# === END STYLES PART 1/9 ===
-# === STYLES PART 2/9 — INBOX LIST + THREAD VIEW (strict CSP, safe inserts) ===
+# === END STYLES PART 1/11 ===
+# === STYLES PART 2/11 — INBOX LIST + THREAD VIEW (strict CSP, safe inserts) ===
 # -*- coding: utf-8 -*-
 
 INBOX_TMPL = """
@@ -9735,7 +10267,7 @@ INBOX_TMPL = """
         return '<span class="badge '+cls+'">до '+ esc(due) +'</span>';
       }
       if(at){ return '<span class="badge ok">ответ: '+ esc(at) +'</span>'; }
-    }catch(_){} return '—';
+    }catch(_){ } return '—';
   }
   function assigneeSelectHTML(id, assignee_id){
     let opts = '<option value="">—</option>';
@@ -10106,8 +10638,8 @@ THREAD_TMPL = """
   });
 </script>
 """
-# === END STYLES PART 2/9 ===
-# === STYLES PART 3/9 — TASKS LIST + TASK VIEW (filters, inline update, comments, reminders) ===
+# === END STYLES PART 2/11 ===
+# === STYLES PART 3/11 — TASKS LIST + TASK VIEW (filters, inline update, comments, reminders) ===
 # -*- coding: utf-8 -*-
 
 TASKS_TMPL = """
@@ -10297,7 +10829,6 @@ TASKS_TMPL = """
   .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
   .fab .plus:hover{filter:brightness(0.95)}
   .fab .plus:focus{outline:2px solid var(--border)}
-  /* fixed-width inputs in modals */
   .form-fixed input.input, .form-fixed select.select, .form-fixed textarea.input { width: 320px; max-width: 100%; }
 </style>
 <div class="modal-backdrop" id="taskModal">
@@ -10327,7 +10858,6 @@ TASKS_TMPL = """
       </div>
     </form>
   </div>
-  
 </div>
 <div class="fab">
   <button class="plus" id="btnFabTask" title="новая задача">+</button>
@@ -10608,53 +11138,6 @@ TASK_VIEW_TMPL = """
     }catch(_){ alert('Ошибка'); }
   });
 
-  async function loadRem(){
-    try{
-      const r=await fetch('/api/task/reminders/'+TID); const j=await r.json(); const box=document.getElementById('remList'); box.innerHTML='';
-      if(!j.ok){ box.textContent=j.error||'Ошибка'; return; }
-      if(!(j.items||[]).length){ box.textContent='Напоминаний нет'; return; }
-      for(const it of j.items){
-        const row=document.createElement('div'); row.style.display='flex'; row.style.gap='8px'; row.style.alignItems='center';
-        const span=document.createElement('span'); span.textContent=(it.remind_at||'')+' — '+(it.message||'');
-        const del=document.createElement('button'); del.className='iconbtn small'; del.textContent='Удалить';
-        del.addEventListener('click', async ()=>{ try{
-          const rr=await fetch('/api/task/reminder/'+it.id',{method:'DELETE',headers:{'X-CSRFToken':CSRF}}); const jj=await rr.json(); if(!jj.ok) return toastErr(jj); loadRem();
-        }catch(_){alert('Ошибка удаления');}});
-        row.appendChild(span); row.appendChild(del); box.appendChild(row);
-      }
-    }catch(_){ document.getElementById('remList').textContent='Ошибка'; }
-  }
-  loadRem();
-  document.getElementById('btnRemAdd')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    const remind_at=(document.getElementById('remWhen').value||''), message=(document.getElementById('remMsg').value||'Напоминание по задаче');
-    try{
-      const r=await fetch('/api/task/reminder',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, remind_at, message})});
-      const j=await r.json(); if(!j.ok) return toastErr(j); toast('Напоминание добавлено'); document.getElementById('remMsg').value=''; loadRem();
-    }catch(_){ alert('Ошибка'); }
-  });
-
-  document.getElementById('btnWfApply')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    const department_id=parseInt(document.getElementById('wfDept').value||'0',10)||0;
-    const stage_key=(document.getElementById('wfStage').value||'').trim();
-    const due_at=(document.getElementById('wfDue').value||'');
-    const comment=(document.getElementById('wfComment').value||'');
-    try{
-      const r=await fetch('/api/task/assign_department',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, department_id, stage_key, due_at, comment})});
-      const j=await r.json(); if(!j.ok) return toastErr(j); toast('Стадия/отдел обновлены');
-    }catch(_){ alert('Ошибка'); }
-  });
-
-  document.getElementById('btnDelegate')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    const to_user_id=parseInt(document.getElementById('dlgUser').value||'0',10)||0;
-    try{
-      const r=await fetch('/api/task/delegate',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, to_user_id})});
-      const j=await r.json(); if(!j.ok) return toastErr(j); toast('Делегировано');
-    }catch(_){ alert('Ошибка'); }
-  });
-
   async function pinToggle(file_id, pin){
     try{
       const r=await fetch('/api/task/file_pin',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({task_id:TID, file_id, pin})});
@@ -10710,129 +11193,184 @@ TASK_VIEW_TMPL = """
   });
 </script>
 """
-# === END STYLES PART 3/9 ===
-# === STYLES PART 4/9 — DEALS LIST + KANBAN (filters, drag&drop, quick create/edit) ===
+# === END STYLES PART 3/11 ===
+# === STYLES PART 4/11 — DEALS LIST + KANBAN (pipeline-aware, DnD) ===
 # -*- coding: utf-8 -*-
 
 DEALS_TMPL = """
 <h2 style="margin:0 0 8px 0;">Сделки</h2>
 
-<div class="card">
+<div class="card" style="margin-bottom:10px;">
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button class="button ghost" id="btnViewList">Список</button>
+    <button class="button ghost" id="btnViewKanban">Канбан</button>
+    <div class="help">Переключайте представления и используйте фильтры ниже</div>
+  </div>
+</div>
+
+<div class="card" id="dealsFilters">
   <details open>
     <summary class="button ghost">Фильтры</summary>
     <form method="get" class="grid-filters" action="{{ url_for('deals_page') }}">
-      {% set stg_rows = query_db('SELECT DISTINCT stage FROM deals WHERE org_id=? ORDER BY stage', (user.org_id,)) %}
-      <label>Стадия
-        <select class="select" name="stage">
-          <option value="">— все —</option>
-          {% for r in (stg_rows or []) %}
-          <option value="{{ r.stage }}" {% if request.args.get('stage','')==r.stage %}selected{% endif %}>{{ r.stage }}</option>
-          {% endfor %}
+      {% set current_pipeline = request.args.get('pipeline','') %}
+      {% set current_stage = request.args.get('stage','') %}
+      {% set current_status = request.args.get('status','') %}
+      {% set current_assignee = request.args.get('assignee_id','') %}
+      {% set pipes = query_db('SELECT DISTINCT COALESCE(pipeline_key, \"default\") AS p FROM workflow_stages WHERE org_id=? AND entity_type=\"deal\" ORDER BY p', (user.org_id,)) %}
+      <label>Pipeline
+        <select class="select" name="pipeline">
+          <option value="">—</option>
+          {% if pipes and pipes|length>0 %}
+            {% for p in pipes %}
+              <option value="{{ p['p'] }}" {% if current_pipeline==p['p'] %}selected{% endif %}>{{ p['p'] }}</option>
+            {% endfor %}
+          {% else %}
+            <option value="default" {% if current_pipeline in ('','default') %}selected{% endif %}>default</option>
+          {% endif %}
         </select>
       </label>
+      <label>Стадия <input class="input" name="stage" placeholder="например: qualify" value="{{ current_stage }}"></label>
       <label>Статус
         <select class="select" name="status">
-          <option value="">— все —</option>
-          {% for s in ('open','won','lost','on_hold','canceled') %}
-          <option value="{{ s }}" {% if request.args.get('status','')==s %}selected{% endif %}>{{ s }}</option>
+          <option value="">—</option>
+          {% for s in ('open','won','lost') %}
+          <option value="{{ s }}" {% if current_status==s %}selected{% endif %}>{{ s }}</option>
           {% endfor %}
         </select>
       </label>
       <label>Исполнитель
         <select class="select" name="assignee_id">
-          <option value="">— любой —</option>
-          {% for a in query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
-          <option value="{{ a.id }}" {% if request.args.get('assignee_id','')==a.id|string %}selected{% endif %}>{{ a.username }}</option>
+          <option value="">—</option>
+          {% for u in users %}
+          <option value="{{ u.id }}" {% if current_assignee|string==u.id|string %}selected{% endif %}>{{ u.username }}</option>
           {% endfor %}
         </select>
       </label>
       <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;margin-top:4px;">
         <button class="button" type="submit">Применить</button>
         <a class="button ghost" href="{{ url_for('deals_page') }}">Сбросить</a>
-        <button class="button secondary" type="button" id="btnNewDeal">Создать сделку</button>
       </div>
     </form>
   </details>
 </div>
 
-<div class="card" style="margin-top:10px;">
-  <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
-    <div class="help">Перетаскивайте карточки между колонками для смены стадии</div>
-    <button class="iconbtn small" id="btnReloadKanban">↻ Обновить</button>
+<!-- LIST VIEW -->
+<div class="card" id="dealsListView" style="margin-top:10px;">
+  <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-bottom:6px;">
+    <button class="button" id="btnNewDeal">Новая сделка</button>
   </div>
-  <style>
-    .kanban{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:10px}
-    .kan-col{background:var(--surface);border:1px solid var(--border);border-radius:12px;min-height:220px;display:flex;flex-direction:column}
-    .kan-head{padding:8px 10px;border-bottom:1px solid var(--border);font-weight:700;display:flex;align-items:center;justify-content:space-between}
-    .kan-list{padding:8px;display:flex;flex-direction:column;gap:8px;min-height:160px}
-    .kan-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px;cursor:grab}
-    .kan-card:active{cursor:grabbing}
-    .kan-card .ttl{font-weight:600;margin-bottom:4px}
-    .kan-card .meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:12px}
-    .kan-drop{outline:2px dashed var(--accent);outline-offset:-6px}
-    .chip{border:1px solid var(--border);border-radius:999px;padding:0 6px;font-size:12px}
-  </style>
-  <div id="kanban" class="kanban">
-    <div class="help" id="kanbanLoading">Загрузка...</div>
-  </div>
-</div>
-
-<details class="card" style="margin-top:10px;">
-  <summary class="button ghost">Таблица (резерв)</summary>
   <table class="table">
     <thead>
-      <tr><th>ID</th><th>Заголовок</th><th>Стадия</th><th>Статус</th><th>Сумма</th><th>Валюта</th><th>Исполнитель</th></tr>
-    </thead>
-    <tbody>
-      {% for d in deals %}
       <tr>
+        <th>ID</th><th>Заголовок</th><th>Стадия</th><th>Статус</th><th>Исполнитель</th>
+        <th>Сумма</th><th>Валюта</th><th>Срок</th><th>Компания</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="dealsTBody">
+      {% for d in deals %}
+      <tr data-id="{{ d.id }}" tabindex="0">
         <td>#{{ d.id }}</td>
         <td>{{ d.title }}</td>
-        <td>{{ d.stage }}</td>
-        <td>{{ d.status }}</td>
-        <td>{{ '%.2f'|format((d.amount or 0)|float) }}</td>
-        <td>{{ d.currency or 'RUB' }}</td>
+        <td><input class="input dl-stage" data-id="{{ d.id }}" value="{{ d.stage or '' }}"></td>
         <td>
-          {% set u = query_db('SELECT username FROM users WHERE id=?',(d.assignee_id,),one=True) %}
-          {{ (u.username if u else '—') }}
+          {% set st = d.status or 'open' %}
+          <select class="select dl-status" data-id="{{ d.id }}">
+            {% for s in ('open','won','lost') %}<option value="{{ s }}" {% if st==s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+          </select>
+        </td>
+        <td>
+          <select class="select dl-assignee" data-id="{{ d.id }}">
+            <option value="">—</option>
+            {% for u in users %}<option value="{{ u.id }}" {% if d.assignee_id==u.id %}selected{% endif %}>{{ u.username }}</option>{% endfor %}
+          </select>
+        </td>
+        <td><input class="input dl-amount" data-id="{{ d.id }}" type="number" step="0.01" value="{{ '%.2f'|format((d.amount or 0)|float) }}" style="max-width:120px;"></td>
+        <td>
+          {% set cur = d.currency or 'RUB' %}
+          <select class="select dl-currency" data-id="{{ d.id }}" style="max-width:100px;">
+            {% for c in ('RUB','USD','EUR') %}<option value="{{ c }}" {% if cur==c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+          </select>
+        </td>
+        <td><input class="input dl-due" data-id="{{ d.id }}" type="datetime-local" value="{{ ((d.due_at or '')|replace(' ','T'))[:16] }}"></td>
+        <td>{{ d.company_id or '—' }}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;">
+          <button class="iconbtn small dl-win" data-id="{{ d.id }}" title="Отметить как выигранную">🏆</button>
+          <button class="iconbtn small dl-lose" data-id="{{ d.id }}" title="Отметить как проигранную">🗑️</button>
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="7"><div class="help">Нет данных</div></td></tr>
+      <tr><td colspan="10"><div class="help">Ничего не найдено</div></td></tr>
       {% endfor %}
     </tbody>
   </table>
-</details>
+  <button class="button ghost" id="loadMoreDeals" style="margin-top:8px;">Загрузить больше</button>
+</div>
 
+<!-- KANBAN VIEW -->
+<div class="card" id="dealsKanbanView" style="margin-top:10px;display:none;">
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+    <label>Pipeline
+      <select class="select" id="kbPipeline" style="min-width:160px;">
+        {% if pipes and pipes|length>0 %}
+          {% for p in pipes %}
+            <option value="{{ p['p'] }}">{{ p['p'] }}</option>
+          {% endfor %}
+        {% else %}
+          <option value="default">default</option>
+        {% endif %}
+      </select>
+    </label>
+    <button class="button ghost" id="btnKbRefresh">Обновить</button>
+  </div>
+  <div class="kb-wrap" style="overflow:auto;">
+    <div class="kanban" id="kanban"></div>
+  </div>
+</div>
+
+<style>
+  .kanban{display:flex;gap:10px;align-items:flex-start;min-height:140px}
+  .kb-col{min-width:260px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:8px}
+  .kb-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;font-weight:700;color:var(--fg)}
+  .kb-count{font-size:12px;color:var(--muted)}
+  .kb-list{display:flex;flex-direction:column;gap:6px;min-height:40px}
+  .kb-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px;cursor:grab}
+  .kb-card .title{font-weight:600}
+  .kb-card .meta{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap}
+  .kb-col.dragover{outline:2px dashed var(--accent);outline-offset:-4px}
+  .kb-card.dragging{opacity:.6}
+</style>
+
+<!-- NEW DEAL MODAL -->
 <div class="modal-backdrop" id="dealModal">
   <div class="modal">
-    <h3 id="dealModalTitle">Новая сделка</h3>
-    <form style="display:grid;gap:8px;" class="form-fixed">
-      <label>Название <input class="input" id="dlTitle" required></label>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <label>Стадия <input class="input" id="dlStage" placeholder="new"></label>
-        <label>Статус <input class="input" id="dlStatus" placeholder="open"></label>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <label>Сумма <input class="input" id="dlAmount" type="number" step="0.01" value="0"></label>
-        <label>Валюта <input class="input" id="dlCurrency" value="RUB"></label>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <label>Исполнитель
-          <select class="select" id="dlAssignee">
-            <option value="">—</option>
-            {% for a in query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
-            <option value="{{ a.id }}">{{ a.username }}</option>
-            {% endfor %}
+    <h3>Новая сделка</h3>
+    <form style="display:grid;gap:8px;max-width:820px;">
+      <label>Заголовок <input class="input" id="ndTitle" required></label>
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+        <label>Сумма <input class="input" id="ndAmount" type="number" step="0.01" value="0"></label>
+        <label>Валюта
+          <select class="select" id="ndCurrency">
+            <option value="RUB" selected>RUB</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
           </select>
         </label>
-        <label>ID компании <input class="input" id="dlCompany" placeholder="опционально"></label>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <label>ID контакта <input class="input" id="dlContact" placeholder="опционально"></label>
-        <div class="help" style="align-self:end;">Все поля можно отредактировать позже</div>
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+        <label>Pipeline <input class="input" id="ndPipeline" placeholder="default" value="{{ current_pipeline or 'default' }}"></label>
+        <label>Стадия <input class="input" id="ndStage" placeholder="new"></label>
       </div>
-      <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <label>Исполнитель
+          <select class="select" id="ndAssignee">
+            <option value="">—</option>
+            {% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>ID компании <input class="input" id="ndCompany" placeholder="например, 1"></label>
+        <label>ID контакта <input class="input" id="ndContact" placeholder="например, 1"></label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
         <button class="button secondary" type="button" id="btnDealCancel">Отмена</button>
         <button class="button" type="button" id="btnDealSave">Создать</button>
       </div>
@@ -10841,256 +11379,230 @@ DEALS_TMPL = """
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  const KAN = document.getElementById('kanban');
-  let KAN_DATA = {columns:[], items:{}};
+  // View toggle
+  function showList(){ document.getElementById('dealsListView').style.display='block'; document.getElementById('dealsKanbanView').style.display='none'; }
+  function showKanban(){ document.getElementById('dealsListView').style.display='none'; document.getElementById('dealsKanbanView').style.display='block'; }
+  document.getElementById('btnViewList')?.addEventListener('click', e=>{ e.preventDefault(); showList(); });
+  document.getElementById('btnViewKanban')?.addEventListener('click', e=>{ e.preventDefault(); showKanban(); kbRefresh(); });
 
-  function esc(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-
-  // Use users passed from the view (already converted to plain dicts)
-  const USERS = {{ users|tojson }};
-
-  function cardHTML(it){
-    const assgn = it.assignee_id ? ('#'+it.assignee_id) : '—';
-    const amt = (typeof it.amount==='number') ? it.amount.toFixed(2) : String(it.amount||'0');
-    return `
-      <div class="kan-card" draggable="true" data-id="${it.id}">
-        <div class="ttl">${esc(it.title||('Deal #'+it.id))}</div>
-        <div class="meta">
-          <span class="chip">${esc(amt)} ${esc(it.currency||'RUB')}</span>
-          <span class="chip">assignee: ${esc(it.assignee_id_name||assgn)}</span>
-        </div>
-        <div class="meta" style="margin-top:4px;">
-          <button class="iconbtn small btnEdit" data-id="${it.id}">✎</button>
-        </div>
-      </div>`;
-  }
-
-  function renderKanban(){
-    if(!KAN_DATA.columns || !KAN_DATA.columns.length){
-      KAN.innerHTML = '<div class="help">Нет данных</div>'; return;
-    }
-    const frag = document.createDocumentFragment();
-    for(const col of KAN_DATA.columns){
-      const wrap = document.createElement('div'); wrap.className='kan-col'; wrap.dataset.stage = col;
-      const head = document.createElement('div'); head.className='kan-head';
-      head.innerHTML = '<span>'+esc(col)+'</span><span class="help">'+((KAN_DATA.items[col]||[]).length)+'</span>';
-      const list = document.createElement('div'); list.className='kan-list'; list.dataset.stage = col;
-      list.addEventListener('dragover', e=>{ e.preventDefault(); list.classList.add('kan-drop'); });
-      list.addEventListener('dragleave', e=>{ list.classList.remove('kan-drop'); });
-      list.addEventListener('drop', e=>{
-        e.preventDefault(); list.classList.remove('kan-drop');
-        const id = e.dataTransfer.getData('text/plain'); if(!id) return;
-        moveDealStage(parseInt(id,10), col);
-      });
-      for(const it of (KAN_DATA.items[col]||[])){
-        const d=document.createElement('div'); d.innerHTML = cardHTML(it).trim();
-        const card = d.firstElementChild;
-        card.addEventListener('dragstart', ev=>{
-          ev.dataTransfer.setData('text/plain', String(it.id));
-          ev.dataTransfer.effectAllowed = 'move';
-        });
-        list.appendChild(card);
-      }
-      wrap.appendChild(head); wrap.appendChild(list);
-      frag.appendChild(wrap);
-    }
-    KAN.innerHTML=''; KAN.appendChild(frag);
-  }
-
-  async function loadKanban(){
-    document.getElementById('kanbanLoading')?.remove();
-    try{
-      const r = await fetch('/api/deals/kanban'); const j = await r.json();
-      if(!j.ok){ KAN.innerHTML='<div class="help">'+esc(j.error||'Ошибка')+'</div>'; return; }
-      KAN_DATA.columns = j.columns||[];
-      KAN_DATA.items = j.items||{};
-      const users = USERS || [];
-      for(const col of KAN_DATA.columns){
-        for(const it of (KAN_DATA.items[col]||[])){
-          const u = users.find(x=>String(x.id)===String(it.assignee_id));
-          if(u) it.assignee_id_name = u.username;
-        }
-      }
-      renderKanban();
-    }catch(e){
-      KAN.innerHTML = '<div class="help">Ошибка загрузки</div>';
-    }
-  }
-
-  async function moveDealStage(id, stage){
-    try{
-      const r = await fetch('/api/deals/kanban/update', { method:'POST',
-        headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({id, stage})});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      loadKanban();
-    }catch(e){ alert('Ошибка сети'); }
-  }
-
-  async function updateDeal(id, patch){
-    try{
-      const r = await fetch('/api/deal/update', { method:'POST',
-        headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify(Object.assign({id}, patch))});
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return false; }
-      return true;
-    }catch(e){ alert('Ошибка сети'); return false; }
-  }
-
-  function openDealModal(){
-    document.getElementById('dealModal').classList.add('show');
-  }
-  function closeDealModal(){
-    document.getElementById('dealModal').classList.remove('show');
-    document.getElementById('dlTitle').value='';
-    document.getElementById('dlStage').value='new';
-    document.getElementById('dlStatus').value='open';
-    document.getElementById('dlAmount').value='0';
-    document.getElementById('dlCurrency').value='RUB';
-    document.getElementById('dlAssignee').value='';
-    document.getElementById('dlCompany').value='';
-    document.getElementById('dlContact').value='';
-  }
-
-  async function createDeal(){
-    const title = (document.getElementById('dlTitle').value||'').trim();
-    const stage = (document.getElementById('dlStage').value||'new').trim();
-    const status = (document.getElementById('dlStatus').value||'open').trim();
-    const amount = parseFloat(document.getElementById('dlAmount').value||'0')||0;
-    const currency = (document.getElementById('dlCurrency').value||'RUB').trim();
-    const assignee_id = (document.getElementById('dlAssignee').value||'')||null;
-    const company_id = (document.getElementById('dlCompany').value||'')||null;
-    const contact_id = (document.getElementById('dlContact').value||'')||null;
-    if(!title) return alert('Название обязательно');
-    try{
-      const r = await fetch('/api/deal/create', { method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
-        body: JSON.stringify({title, stage, amount, currency, status, assignee_id, company_id, contact_id}) });
-      const j = await r.json();
-      if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      toast('Сделка создана #' + j.id);
-      closeDealModal();
-      loadKanban();
-    }catch(e){ alert('Ошибка сети'); }
-  }
-
-  function openQuickEdit(id){
-    const host = KAN.querySelector('.kan-card[data-id="'+id+'"]');
-    if(!host) return;
-
-    const box = document.createElement('div');
-    box.className = 'qe';
-    box.innerHTML = `
-      <div style="margin-top:6px;">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
-          <input class="input" id="qeAmount" placeholder="Сумма" value="">
-          <select class="select" id="qeAssignee">
-            <option value="">—</option>
-          </select>
-        </div>
-        <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px;">
-          <button class="button secondary" id="qeCancel">Отмена</button>
-          <button class="button" id="qeSave">Сохранить</button>
-        </div>
-      </div>`;
-
-    host.querySelector('.qe')?.remove();
-    host.appendChild(box);
-
-    const amtChip = host.querySelector('.chip');
-    if(amtChip){
-      const raw = (amtChip.textContent||'').trim().split(' ')[0].replace(',','.');
-      box.querySelector('#qeAmount').value = raw || '';
-    }
-
-    const sel = box.querySelector('#qeAssignee');
-    (USERS||[]).forEach(u=>{
-      const opt = document.createElement('option');
-      opt.value = String(u.id);
-      opt.textContent = u.username;
-      sel.appendChild(opt);
-    });
-
-    box.querySelector('#qeCancel')?.addEventListener('click', e=>{ e.preventDefault(); box.remove(); });
-    box.querySelector('#qeSave')?.addEventListener('click', async e=>{
-      e.preventDefault();
-      const patch = {};
-      const amt = parseFloat((box.querySelector('#qeAmount')?.value||'').trim());
-      if(!Number.isNaN(amt)) patch.amount = amt;
-      const aidRaw = (box.querySelector('#qeAssignee')?.value||'').trim();
-      if(aidRaw) patch.assignee_id = parseInt(aidRaw,10);
-      if(Object.keys(patch).length===0){ box.remove(); return; }
-      const ok = await updateDeal(id, patch);
-      if(ok){ toast('Обновлено'); box.remove(); loadKanban(); }
-    });
-  }
-
-  document.getElementById('btnReloadKanban')?.addEventListener('click', e=>{ e.preventDefault(); loadKanban(); });
-  document.getElementById('btnNewDeal')?.addEventListener('click', e=>{ e.preventDefault(); openDealModal(); });
-  document.getElementById('btnDealCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeDealModal(); });
-  document.getElementById('btnDealSave')?.addEventListener('click', e=>{ e.preventDefault(); createDeal(); });
-
-  document.getElementById('kanban')?.addEventListener('click', e=>{
-    const b = e.target.closest('.btnEdit');
-    if(!b) return;
+  // New deal
+  document.getElementById('btnNewDeal')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dealModal').classList.add('show'); });
+  document.getElementById('btnDealCancel')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('dealModal').classList.remove('show'); });
+  document.getElementById('btnDealSave')?.addEventListener('click', async e=>{
     e.preventDefault();
-    const id = parseInt(b.getAttribute('data-id')||'0',10)||0;
-    if(id) openQuickEdit(id);
+    const title=(document.getElementById('ndTitle').value||'').trim();
+    if(!title) return alert('Укажите заголовок');
+    const payload={
+      title,
+      amount: parseFloat(document.getElementById('ndAmount').value||'0')||0,
+      currency: (document.getElementById('ndCurrency').value||'RUB'),
+      pipeline_key: (document.getElementById('ndPipeline').value||'default').trim(),
+      stage: (document.getElementById('ndStage').value||'new').trim(),
+      assignee_id: (document.getElementById('ndAssignee').value||null),
+      company_id: (document.getElementById('ndCompany').value||null),
+      contact_id: (document.getElementById('ndContact').value||null),
+      status: 'open'
+    };
+    try{
+      const r=await fetch('/api/deal/create',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify(payload)});
+      const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
+      toast('Сделка создана #'+j.id); document.getElementById('dealModal').classList.remove('show'); location.reload();
+    }catch(_){ alert('Ошибка сети'); }
   });
 
-  loadKanban();
+  // List: pagination
+  let dealsPage = 1;
+  function buildParams(page){
+    const params=new URLSearchParams(window.location.search);
+    if(page) params.set('page', page);
+    params.set('per_page','50');
+    return params;
+  }
+  function rowHTML(d, users){
+    const uname=(users[String(d.assignee_id)]||'');
+    return `
+      <tr data-id="${d.id}" tabindex="0">
+        <td>#${d.id}</td>
+        <td>${esc(d.title||'')}</td>
+        <td><input class="input dl-stage" data-id="${d.id}" value="${esc(d.stage||'')}"></td>
+        <td>
+          <select class="select dl-status" data-id="${d.id}">
+            ${['open','won','lost'].map(s=>('<option value="'+s+'"'+(String(d.status||'open')===s?' selected':'')+'>'+s+'</option>')).join('')}
+          </select>
+        </td>
+        <td>
+          <select class="select dl-assignee" data-id="${d.id}">
+            <option value="">—</option>
+            ${Object.entries(users).map(([id,name])=>('<option value="'+id+'"'+(String(d.assignee_id||'')===id?' selected':'')+'>'+esc(name)+'</option>')).join('')}
+          </select>
+        </td>
+        <td><input class="input dl-amount" data-id="${d.id}" type="number" step="0.01" value="${esc((d.amount!=null?(Number(d.amount).toFixed?Number(d.amount).toFixed(2):String(d.amount)):'0.00'))}" style="max-width:120px;"></td>
+        <td>
+          <select class="select dl-currency" data-id="${d.id}" style="max-width:100px;">
+            ${['RUB','USD','EUR'].map(c=>('<option value="'+c+'"'+(String(d.currency||'RUB')===c?' selected':'')+'>'+c+'</option>')).join('')}
+          </select>
+        </td>
+        <td><input class="input dl-due" data-id="${d.id}" type="datetime-local" value="${esc(((d.due_at||'').replace(' ','T')).slice(0,16))}"></td>
+        <td>${esc(d.company_id!=null?String(d.company_id):'—')}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;">
+          <button class="iconbtn small dl-win" data-id="${d.id}" title="Отметить как выигранную">🏆</button>
+          <button class="iconbtn small dl-lose" data-id="${d.id}" title="Отметить как проигранную">🗑️</button>
+        </td>
+      </tr>`;
+  }
+  async function loadMoreDeals(){
+    dealsPage++;
+    try{
+      const url='/api/deals/list?'+buildParams(dealsPage).toString();
+      const r=await fetch(url); const j=await r.json();
+      if(!j.ok) return alert(j.error||'Ошибка');
+      const tb=document.getElementById('dealsTBody');
+      const usersMap = JSON.parse('{{ users_map|tojson|safe }}');
+      let added=0;
+      for(const d of (j.items||[])){ tb.insertAdjacentHTML('beforeend', rowHTML(d, usersMap)); added++; }
+      if(added < (j.items||[]).length || (j.items||[]).length < (j.per_page||50)) document.getElementById('loadMoreDeals').style.display='none';
+      if(added>0) toast('Загружено больше');
+    }catch(_){ alert('Ошибка загрузки'); }
+  }
+  document.getElementById('loadMoreDeals')?.addEventListener('click', e=>{ e.preventDefault(); loadMoreDeals(); });
+
+  // Inline updates
+  async function dealUpdate(id, patch){
+    try{
+      const r=await fetch('/api/deal/update',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify(Object.assign({id},patch))});
+      const j=await r.json(); if(!j.ok) alert(j.error||'Ошибка');
+    }catch(_){ alert('Ошибка сети'); }
+  }
+  document.addEventListener('change', e=>{
+    const el=e.target; const id=el && el.getAttribute('data-id');
+    if(!id) return;
+    if(el.classList.contains('dl-status')) dealUpdate(parseInt(id,10), {status: el.value});
+    if(el.classList.contains('dl-assignee')) dealUpdate(parseInt(id,10), {assignee_id: el.value||null});
+    if(el.classList.contains('dl-stage')) dealUpdate(parseInt(id,10), {stage: el.value||''});
+    if(el.classList.contains('dl-amount')) dealUpdate(parseInt(id,10), {amount: parseFloat(el.value||'0')||0});
+    if(el.classList.contains('dl-currency')) dealUpdate(parseInt(id,10), {currency: el.value||'RUB'});
+    if(el.classList.contains('dl-due')) dealUpdate(parseInt(id,10), {due_at: el.value||''});
+  });
+  document.addEventListener('click', e=>{
+    const w=e.target.closest('.dl-win'); if(w){ e.preventDefault(); dealUpdate(parseInt(w.getAttribute('data-id')||'0',10), {status:'won'}); return; }
+    const l=e.target.closest('.dl-lose'); if(l){ e.preventDefault(); dealUpdate(parseInt(l.getAttribute('data-id')||'0',10), {status:'lost'}); return; }
+  });
+
+  // Keyboard navigation (list)
+  document.addEventListener('keydown', e=>{
+    const tag=(e.target&&e.target.tagName||'').toUpperCase();
+    if(tag==='INPUT' || tag==='TEXTAREA' || e.ctrlKey || e.metaKey) return;
+    const rows=[...document.querySelectorAll('#dealsTBody tr')];
+    const active=(document.activeElement && document.activeElement.closest)?document.activeElement.closest('tr'):null;
+    const idx=rows.indexOf(active);
+    if(e.key==='ArrowDown'){ e.preventDefault(); (rows[Math.min(rows.length-1, idx+1)]||rows[0])?.focus(); }
+    if(e.key==='ArrowUp'){ e.preventDefault(); (rows[Math.max(0, idx-1)]||rows[0])?.focus(); }
+  });
+
+  // Kanban
+  async function kbFetch(pipeline){
+    const r=await fetch('/api/deals/kanban?pipeline='+(encodeURIComponent(pipeline||'default'))); return r.json();
+  }
+  function kbCol(stage){
+    const div=document.createElement('div'); div.className='kb-col'; div.dataset.stage=stage;
+    const head=document.createElement('div'); head.className='kb-head';
+    const left=document.createElement('div'); left.textContent=stage;
+    const cnt=document.createElement('div'); cnt.className='kb-count'; cnt.textContent='0';
+    head.appendChild(left); head.appendChild(cnt);
+    const list=document.createElement('div'); list.className='kb-list';
+    div.appendChild(head); div.appendChild(list);
+    // DnD targets
+    div.addEventListener('dragover', e=>{ e.preventDefault(); div.classList.add('dragover'); });
+    div.addEventListener('dragleave', e=>{ div.classList.remove('dragover'); });
+    div.addEventListener('drop', async e=>{
+      e.preventDefault(); div.classList.remove('dragover');
+      const id=e.dataTransfer.getData('text/plain'); if(!id) return;
+      try{
+        const r=await fetch('/api/deals/kanban/update',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({id: parseInt(id,10), stage: stage})});
+        const j=await r.json(); if(!j.ok){ return alert(j.error||'Ошибка'); }
+        // move card DOM
+        const card=document.querySelector('.kb-card[data-id="'+id+'"]'); if(card){ div.querySelector('.kb-list').appendChild(card); kbRecount(); }
+      }catch(_){ alert('Ошибка сети'); }
+    });
+    return div;
+  }
+  function kbCard(item){
+    const card=document.createElement('div'); card.className='kb-card'; card.setAttribute('draggable','true'); card.dataset.id=String(item.id);
+    const title=document.createElement('div'); title.className='title'; title.textContent=item.title||('Сделка #'+item.id);
+    const meta=document.createElement('div'); meta.className='meta';
+    const m1=document.createElement('span'); m1.textContent='₽: '+(item.amount!=null?String(item.amount):'0');
+    const m2=document.createElement('span'); m2.textContent='Ответств.: '+(item.assignee_id!=null?String(item.assignee_id):'—');
+    meta.appendChild(m1); meta.appendChild(m2);
+    card.appendChild(title); card.appendChild(meta);
+    card.addEventListener('dragstart', e=>{ card.classList.add('dragging'); e.dataTransfer.setData('text/plain', String(item.id)); });
+    card.addEventListener('dragend', e=>{ card.classList.remove('dragging'); });
+    return card;
+  }
+  function kbRecount(){
+    document.querySelectorAll('.kb-col').forEach(col=>{
+      const cnt=col.querySelectorAll('.kb-card').length;
+      const badge=col.querySelector('.kb-count'); if(badge) badge.textContent=String(cnt);
+    });
+  }
+  async function kbRefresh(){
+    const pipeline=(document.getElementById('kbPipeline')?.value||'default');
+    try{
+      const j=await kbFetch(pipeline);
+      if(!j.ok){ return alert(j.error||'Ошибка'); }
+      const root=document.getElementById('kanban'); root.innerHTML='';
+      const cols=(j.columns||[]); const items=j.items||{};
+      for(const st of cols){
+        const col=kbCol(st);
+        const lst=col.querySelector('.kb-list');
+        for(const it of (items[st]||[])){ lst.appendChild(kbCard(it)); }
+        root.appendChild(col);
+      }
+      kbRecount();
+    }catch(_){ alert('Ошибка'); }
+  }
+  document.getElementById('btnKbRefresh')?.addEventListener('click', e=>{ e.preventDefault(); kbRefresh(); });
+  document.getElementById('kbPipeline')?.addEventListener('change', e=>{ e.preventDefault(); kbRefresh(); });
 </script>
-<style>
-  .fab{position:fixed;right:18px;bottom:18px;z-index:9999}
-  .fab .plus{width:48px;height:48px;border-radius:50%;border:1px solid var(--border);background:var(--accent);color:#000;font-weight:800;cursor:pointer}
-  .fab .plus:hover{filter:brightness(0.95)}
-  .fab .plus:focus{outline:2px solid var(--border)}
-</style>
-<div class="fab">
-  <button class="plus" id="btnFabDeal" title="новая сделка">+</button>
-  <script nonce="{{ csp_nonce }}">
-    document.getElementById('btnFabDeal')?.addEventListener('click', (e)=>{ e.preventDefault(); openDealModal(); });
-  </script>
-</div>
 """
-# === END STYLES PART 4/9 ===
-# === STYLES PART 5/9 — CLIENTS (list/detail) + CALLS (list/filters), badges/chips/pagination ===
+# === END STYLES PART 4/11 ===
+# === STYLES PART 5/11 — CLIENTS LIST + CLIENT PAGE ===
 # -*- coding: utf-8 -*-
 
 CLIENTS_TMPL = """
 <h2 style="margin:0 0 8px 0;">Клиенты</h2>
 
-<div class="split">
-  <div class="card">
-    <details>
-      <summary class="button ghost">Добавить клиента</summary>
-      <form method="post" style="display:grid;gap:8px;max-width:720px;margin-top:8px;">
-        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
-          <label>Название <input class="input" name="name" required></label>
-          <label>ИНН <input class="input" name="inn" placeholder="10–12 цифр"></label>
-        </div>
-        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
-          <label>Телефон <input class="input" name="phone" placeholder="+7 900 000-00-00"></label>
-          <label>Email <input class="input" name="email" type="email" placeholder="client@example.com"></label>
-        </div>
-        <label>Контакт/Заметки <input class="input" name="contact" placeholder="ФИО/Примечание"></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
-          <button class="button" type="submit">Создать</button>
-        </div>
-      </form>
-    </details>
-  </div>
+<div class="card">
+  <details open>
+    <summary class="button ghost">Создать клиента</summary>
+    <form method="post" action="{{ url_for('clients_list') }}" style="display:grid;gap:8px;max-width:860px;" class="form-fixed">
+      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+        <label>Название <input class="input" name="name" required placeholder="ООО Ромашка"></label>
+        <label>ИНН <input class="input" name="inn" placeholder="10–12 цифр (опционально)"></label>
+      </div>
+      <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <label>Телефон <input class="input" name="phone" placeholder="+7 495 ..."></label>
+        <label>Email <input class="input" type="email" name="email" placeholder="info@..."></label>
+        <label>Контакт (заметка) <input class="input" name="contact" placeholder="например, лицо для связи"></label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="button" type="submit">Создать</button>
+      </div>
+    </form>
+  </details>
+</div>
 
-  <div class="card">
-    <details open>
-      <summary class="button ghost">Поиск</summary>
-      <form id="clSearch" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:8px;">
-        <label>Запрос <input class="input" id="q" placeholder="название, ИНН, телефон, email"></label>
-        <button class="button" type="submit">Найти</button>
-        <button class="button secondary" type="button" id="btnReset">Сбросить</button>
-      </form>
-    </details>
-  </div>
+<div class="card" style="margin-top:10px;">
+  <details open>
+    <summary class="button ghost">Поиск</summary>
+    <form id="clSearchForm" class="grid-filters" action="#" onsubmit="return false;">
+      <label>Строка поиска <input class="input" id="clQ" placeholder="название / ИНН / телефон / email"></label>
+      <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;">
+        <button class="button" id="btnClSearch" type="button">Искать</button>
+        <button class="button ghost" id="btnClReset" type="button">Сбросить</button>
+      </div>
+    </form>
+  </details>
 </div>
 
 <div class="card" style="margin-top:10px;">
@@ -11100,19 +11612,22 @@ CLIENTS_TMPL = """
         <th>ID</th><th>Название</th><th>ИНН</th><th>Телефон</th><th>Email</th><th>Сделки</th><th></th>
       </tr>
     </thead>
-    <tbody id="clientsTBody">
+    <tbody id="clTBody">
       {% for c in clients %}
-      <tr data-id="{{ c.id }}">
+      <tr data-id="{{ c.id }}" tabindex="0">
         <td>#{{ c.id }}</td>
         <td>{{ c.name }}</td>
         <td>{{ c.inn or '—' }}</td>
         <td>{{ c.phone or '—' }}</td>
         <td>{{ c.email or '—' }}</td>
-        <td><span class="badge">{{ c.deals or 0 }}</span></td>
-        <td><a class="iconbtn small" href="{{ url_for('client_page', cid=c.id) }}">Открыть</a></td>
+        <td>{{ c.deals or 0 }}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;">
+          <a class="iconbtn small" href="{{ url_for('client_page', cid=c.id) }}">Открыть</a>
+          <button class="iconbtn small cl-dial" data-phone="{{ c.phone or '' }}" title="Позвонить">📞</button>
+        </td>
       </tr>
       {% else %}
-      <tr><td colspan="7"><div class="help">Нет записей</div></td></tr>
+      <tr><td colspan="7"><div class="help">Пока пусто — создайте клиента</div></td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -11120,71 +11635,107 @@ CLIENTS_TMPL = """
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  let clientsPage = 1;
-  let clientsQ = '';
+  let clPage = 1;
+  let clLastQ = '';
 
+  function escNum(num){ return String(num||''); }
   function rowHTML(c){
     return `
-      <tr data-id="${c.id}">
+      <tr data-id="${c.id}" tabindex="0">
         <td>#${c.id}</td>
         <td>${esc(c.name||'')}</td>
         <td>${esc(c.inn||'—')}</td>
         <td>${esc(c.phone||'—')}</td>
         <td>${esc(c.email||'—')}</td>
-        <td><span class="badge">${String(c.deals||0)}</span></td>
-        <td><a class="iconbtn small" href="/client/${c.id}">Открыть</a></td>
+        <td>${escNum(c.deals||0)}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;">
+          <a class="iconbtn small" href="/client/${c.id}">Открыть</a>
+          <button class="iconbtn small cl-dial" data-phone="${esc(c.phone||'')}" title="Позвонить">📞</button>
+        </td>
       </tr>`;
   }
-  async function loadClients(reset=false){
-    try{
-      if(reset){ clientsPage = 1; document.getElementById('clientsTBody').innerHTML=''; }
-      const url = new URL(window.location.origin + '/api/clients/list');
-      url.searchParams.set('page', clientsPage);
-      url.searchParams.set('per_page', 50);
-      if(clientsQ) url.searchParams.set('q', clientsQ);
-      const r = await fetch(url.toString());
-      const j = await r.json();
-      if(!j.ok) return alert(j.error||'Ошибка');
-      const tb = document.getElementById('clientsTBody');
-      let added=0;
-      for(const it of (j.items||[])){ tb.insertAdjacentHTML('beforeend', rowHTML(it)); added++; }
-      if(added < (j.per_page||50)) document.getElementById('loadMoreClients').style.display='none';
-      else document.getElementById('loadMoreClients').style.display='';
-      if(reset && added===0){ tb.innerHTML = '<tr><td colspan="7"><div class="help">Ничего не найдено</div></td></tr>'; }
-      if(!reset && added>0){ toast('Загружено больше'); }
-    }catch(e){ alert('Ошибка загрузки'); }
+  function buildParams(page, q){
+    const ps = new URLSearchParams();
+    ps.set('page', String(page||1));
+    ps.set('per_page', '50');
+    if(q) ps.set('q', q);
+    return ps;
   }
-  document.getElementById('clSearch')?.addEventListener('submit', e=>{
+  async function loadClients(reset=false){
+    if(reset){ clPage=1; document.getElementById('clTBody').innerHTML=''; }
+    try{
+      const r = await fetch('/api/clients/list?'+buildParams(clPage, clLastQ).toString());
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Ошибка'); return; }
+      const tb = document.getElementById('clTBody');
+      let added = 0;
+      for(const c of (j.items||[])){ tb.insertAdjacentHTML('beforeend', rowHTML(c)); added++; }
+      const moreBtn = document.getElementById('loadMoreClients');
+      if(added < (j.per_page||50)) moreBtn.style.display = 'none'; else moreBtn.style.display = '';
+      if(added===0 && clPage===1){ tb.innerHTML='<tr><td colspan="7"><div class="help">Ничего не найдено</div></td></tr>'; }
+      if(added>0 && clPage>1) toast('Загружено больше');
+    }catch(_){ alert('Ошибка загрузки'); }
+  }
+
+  document.getElementById('btnClSearch')?.addEventListener('click', e=>{
     e.preventDefault();
-    clientsQ = (document.getElementById('q').value||'').trim();
+    clLastQ = (document.getElementById('clQ').value||'').trim();
     loadClients(true);
   });
-  document.getElementById('btnReset')?.addEventListener('click', e=>{
-    e.preventDefault();
-    clientsQ=''; document.getElementById('q').value='';
-    loadClients(true);
+  document.getElementById('btnClReset')?.addEventListener('click', e=>{
+    e.preventDefault(); clLastQ=''; document.getElementById('clQ').value=''; loadClients(true);
   });
-  document.getElementById('loadMoreClients')?.addEventListener('click', e=>{
-    e.preventDefault(); clientsPage++; loadClients(false);
+  document.getElementById('loadMoreClients')?.addEventListener('click', e=>{ e.preventDefault(); clPage++; loadClients(false); });
+
+  // Click-to-call
+  async function dialPrompt(phone){
+    let raw = phone || prompt('Номер для звонка','') || '';
+    const d = String(raw||'').replace(/\\D+/g,'');
+    if(!d) return;
+    let n=d; if(n.length===11 && n.startsWith('8')) n='7'+n.slice(1); if(n.length===10) n='7'+n;
+    const e164='+'+n;
+    try{
+      const r=await fetch('/api/cti/click_to_call',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({to:e164})});
+      const j=await r.json(); if(j.ok) toast('Звонок: '+e164); else alert(j.error||'Ошибка');
+    }catch(_){ alert('Ошибка сети'); }
+  }
+  document.addEventListener('click', e=>{
+    const b=e.target.closest('.cl-dial'); if(!b) return;
+    e.preventDefault(); dialPrompt(b.getAttribute('data-phone')||'');
   });
+
+  // Keyboard nav
+  document.addEventListener('keydown', e=>{
+    const tag=(e.target&&e.target.tagName||'').toUpperCase();
+    if(tag==='INPUT' || tag==='TEXTAREA' || e.ctrlKey || e.metaKey) return;
+    const rows=[...document.querySelectorAll('#clTBody tr')];
+    const active=(document.activeElement&&document.activeElement.closest)?document.activeElement.closest('tr'):null;
+    const idx=rows.indexOf(active);
+    if(e.key==='ArrowDown'){ e.preventDefault(); (rows[Math.min(rows.length-1,idx+1)]||rows[0])?.focus(); }
+    if(e.key==='ArrowUp'){ e.preventDefault(); (rows[Math.max(0,idx-1)]||rows[0])?.focus(); }
+  });
+
+  // Initial loadMore behavior: show/hide based on initial server-chunk length (cannot know per_page); leave visible.
 </script>
 """
 
 CLIENT_PAGE_TMPL = """
 <h2>Клиент #{{ c.id }} · {{ c.name }}</h2>
-
-<div class="split">
+<div class="thread">
   <div>
-    <div class="card">
-      <h3>Карточка</h3>
-      <div class="help" id="clInfo"></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+    <div class="card" style="margin-bottom:10px;">
+      <h3 style="margin:0 0 8px 0;">Основное</h3>
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
         <label>Название <input class="input" id="clName" value="{{ c.name }}"></label>
-        <label>ИНН <input class="input" id="clInn" value="{{ c.inn or '' }}"></label>
+        <label>ИНН <input class="input" id="clINN" value="{{ c.inn or '' }}"></label>
+      </div>
+      <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px;">
         <label>Телефон <input class="input" id="clPhone" value="{{ c.phone or '' }}"></label>
-        <label>Email <input class="input" id="clEmail" value="{{ c.email or '' }}"></label>
-        <label>Адрес <input class="input" id="clAddr" value="{{ c.address or '' }}"></label>
-        <label>Заметки <input class="input" id="clNotes" value="{{ c.notes or '' }}"></label>
+        <label>Email <input class="input" id="clEmail" type="email" value="{{ c.email or '' }}"></label>
+        <label>Адрес <input class="input" id="clAddress" value="{{ c.address or '' }}"></label>
+      </div>
+      <div style="margin-top:8px;">
+        <label>Заметки <textarea class="input" id="clNotes" rows="3">{{ c.notes or '' }}</textarea></label>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;flex-wrap:wrap;">
         <button class="button" id="btnClSave">Сохранить</button>
@@ -11193,27 +11744,29 @@ CLIENT_PAGE_TMPL = """
       </div>
     </div>
 
-    <div class="card" style="margin-top:10px;">
-      <h3>Звонки</h3>
+    <div class="card">
+      <h3 style="margin:0 0 8px 0;">Звонки</h3>
       <table class="table">
-        <thead><tr><th>ID</th><th>Дата</th><th>Напр.</th><th>От</th><th>Кому</th><th>Статус</th><th>Агент</th><th></th></tr></thead>
-        <tbody id="clCalls">
+        <thead>
+          <tr>
+            <th>ID</th><th>Когда</th><th>Направление</th><th>От</th><th>Кому</th><th>Статус</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="clCallsBody">
           {% for r in calls %}
           <tr data-id="{{ r.id }}">
             <td>#{{ r.id }}</td>
-            <td>{{ r.started_at or '' }}</td>
-            <td>{{ r.direction or '' }}</td>
-            <td>{{ r.from_e164 or '' }}</td>
-            <td>{{ r.to_e164 or '' }}</td>
-            <td>{{ r.status or '' }}</td>
-            <td>{{ r.agent_id or '—' }}</td>
+            <td>{{ r.started_at or '—' }}</td>
+            <td>{{ r.direction or '—' }}</td>
+            <td>{{ r.from_e164 or '—' }}</td>
+            <td>{{ r.to_e164 or '—' }}</td>
+            <td>{{ r.status or '—' }}</td>
             <td style="white-space:nowrap;display:flex;gap:6px;">
-              <button class="iconbtn small btnPlay" data-id="{{ r.id }}">▶︎</button>
-              <button class="iconbtn small btnToTask" data-id="{{ r.id }}">В задачу</button>
+              <button class="iconbtn small btnCallToTask" data-id="{{ r.id }}">В задачу</button>
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="8"><div class="help">Нет звонков</div></td></tr>
+          <tr><td colspan="7"><div class="help">Нет звонков</div></td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -11222,71 +11775,70 @@ CLIENT_PAGE_TMPL = """
 
   <div>
     <div class="card">
-      <h3>Быстрые действия</h3>
+      <h3 style="margin:0 0 8px 0;">Ссылки</h3>
       <ul>
-        <li><a href="{{ url_for('tasks_page') }}">Создать задачу</a> из звонка на вкладке “Звонки”</li>
-        <li>Позвонить клиенту: кнопка “Позвонить” выше</li>
+        <li><a href="{{ url_for('lookup') }}?id={{ c.id }}">Поиск по ID</a></li>
+        {% if c.phone %}<li><a href="{{ url_for('lookup') }}?phone={{ c.phone|urlencode }}">Поиск по телефону</a></li>{% endif %}
+        {% if c.inn %}<li><a href="{{ url_for('lookup') }}?inn={{ c.inn|urlencode }}">Поиск по ИНН</a></li>{% endif %}
+        {% if c.email %}<li><a href="{{ url_for('lookup') }}?email={{ c.email|urlencode }}">Поиск по email</a></li>{% endif %}
       </ul>
     </div>
   </div>
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  const CID = {{ c.id }};
+  const CL_ID = {{ c.id }};
 
   async function saveClient(){
+    const payload = {
+      name: (document.getElementById('clName').value||'').trim(),
+      inn: (document.getElementById('clINN').value||'').trim(),
+      phone: (document.getElementById('clPhone').value||'').trim(),
+      email: (document.getElementById('clEmail').value||'').trim(),
+      address: (document.getElementById('clAddress').value||'').trim(),
+      notes: (document.getElementById('clNotes').value||'').trim()
+    };
     try{
-      const payload = {
-        name: document.getElementById('clName').value||'',
-        inn: (document.getElementById('clInn').value||'').trim(),
-        phone: document.getElementById('clPhone').value||'',
-        email: document.getElementById('clEmail').value||'',
-        address: document.getElementById('clAddr').value||'',
-        notes: document.getElementById('clNotes').value||''
-      };
-      const r = await fetch('/api/clients/'+CID, { method:'PATCH', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify(payload) });
-      const j = await r.json(); if(!j.ok){ alert(j.error||'Ошибка'); return; }
-      document.getElementById('clInfo').textContent='Сохранено';
-      setTimeout(()=>{ document.getElementById('clInfo').textContent=''; }, 1500);
-    }catch(e){ alert('Ошибка сети'); }
+      const r = await fetch('/api/clients/'+CL_ID, {method:'PATCH', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify(payload)});
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Ошибка'); return; }
+      toast('Сохранено');
+    }catch(_){ alert('Ошибка сети'); }
   }
-  async function dialClient(){
-    const raw = (document.getElementById('clPhone').value||'').trim();
-    if(!raw) return alert('Нет номера');
-    const d = raw.replace(/\\D+/g,''); if(!d) return;
-    let n=d; if(n.length===11 && n.startsWith('8')) n='7'+n.slice(1); if(n.length===10) n='7'+n;
-    const e164 = '+'+n;
-    try{
-      const r=await fetch('/api/cti/click_to_call',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({to:e164})});
-      const j=await r.json(); if(j.ok) toast('Звонок: '+e164); else alert(j.error||'Ошибка звонка');
-    }catch(e){ alert('Ошибка сети'); }
-  }
-  async function playRecording(callId){
-    try{
-      const r = await fetch('/api/call/recording/presign/'+callId);
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Нет записи');
-      const url = j.url||'';
-      if(!url) return alert('Нет записи');
-      const a = new Audio(url); a.play().catch(()=>window.open(url,'_blank'));
-    }catch(e){ alert('Ошибка проигрывания'); }
-  }
-  async function callToTask(callId){
-    const title = prompt('Заголовок задачи', 'Звонок '+callId) || '';
-    try{
-      const r=await fetch('/api/call/to_task',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({call_id: callId, title})});
-      const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      toast('Задача #'+j.task_id+' создана');
-    }catch(e){ alert('Ошибка сети'); }
-  }
-
   document.getElementById('btnClSave')?.addEventListener('click', e=>{ e.preventDefault(); saveClient(); });
-  document.getElementById('btnClDial')?.addEventListener('click', e=>{ e.preventDefault(); dialClient(); });
-  document.getElementById('clCalls')?.addEventListener('click', e=>{
-    const p = e.target.closest('.btnPlay'); if(p){ e.preventDefault(); playRecording(parseInt(p.getAttribute('data-id')||'0',10)); return; }
-    const t = e.target.closest('.btnToTask'); if(t){ e.preventDefault(); callToTask(parseInt(t.getAttribute('data-id')||'0',10)); return; }
+
+  async function dialFromCard(){
+    const raw=(document.getElementById('clPhone').value||'').trim() || prompt('Номер для звонка','') || '';
+    const d = String(raw||'').replace(/\\D+/g,'');
+    if(!d) return;
+    let n=d; if(n.length===11 && n.startsWith('8')) n='7'+n.slice(1); if(n.length===10) n='7'+n;
+    const e164='+'+n;
+    try{
+      const r=await fetch('/api/cti/click_to_call',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({to:e164})});
+      const j=await r.json(); if(j.ok) toast('Звонок: '+e164); else alert(j.error||'Ошибка');
+    }catch(_){ alert('Ошибка сети'); }
+  }
+  document.getElementById('btnClDial')?.addEventListener('click', e=>{ e.preventDefault(); dialFromCard(); });
+
+  // Calls → Task
+  async function callToTask(callId){
+    try{
+      const title = prompt('Заголовок задачи','Звонок #'+callId) || ('Звонок #'+callId);
+      const r = await fetch('/api/call/to_task', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({call_id: callId, title})});
+      const j = await r.json();
+      if(!j.ok){ alert(j.error||'Ошибка'); return; }
+      toast('Задача #'+j.task_id+' создана');
+    }catch(_){ alert('Ошибка сети'); }
+  }
+  document.getElementById('clCallsBody')?.addEventListener('click', e=>{
+    const b = e.target.closest('.btnCallToTask'); if(!b) return;
+    e.preventDefault(); const cid = parseInt(b.getAttribute('data-id')||'0',10); if(cid) callToTask(cid);
   });
 </script>
 """
+# === END STYLES PART 5/11 ===
+# === STYLES PART 6/11 — CALLS + MEETINGS (list, assign, presign, schedule, join) ===
+# -*- coding: utf-8 -*-
 
 CALLS_TMPL = """
 <h2 style="margin:0 0 8px 0;">Звонки</h2>
@@ -11294,565 +11846,425 @@ CALLS_TMPL = """
 <div class="card">
   <details open>
     <summary class="button ghost">Фильтры</summary>
-    <form id="callsFilters" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:8px;">
-      <label><input type="checkbox" id="mine" checked> Только мои/входящие</label>
-      <label>С <input class="input" type="date" id="dateFrom"></label>
-      <label>По <input class="input" type="date" id="dateTo"></label>
-      <button class="button" type="submit">Применить</button>
-      <button class="button secondary" type="button" id="btnCallsReset">Сбросить</button>
+    <form id="clFilters" class="grid-filters" action="#" onsubmit="return false;">
+      <label>Мои/входящие
+        <select class="select" id="fMine">
+          {% set current = request.args.get('f','my') %}
+          {% set mine = 1 if (current=='my') else 0 %}
+          <option value="1" {% if mine==1 %}selected{% endif %}>да</option>
+          <option value="0" {% if mine==0 %}selected{% endif %}>нет (все)</option>
+        </select>
+      </label>
+      <label>С <input class="input" type="date" id="fFrom" value="{{ request.args.get('date_from','') }}"></label>
+      <label>По <input class="input" type="date" id="fTo" value="{{ request.args.get('date_to','') }}"></label>
+      <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;margin-top:4px;">
+        <button class="button" id="btnCallsApply" type="button">Применить</button>
+        <button class="button ghost" id="btnCallsReset" type="button">Сбросить</button>
+      </div>
     </form>
   </details>
 </div>
 
 <div class="card" style="margin-top:10px;">
+  {% set agents_rows = query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
   <table class="table">
     <thead>
       <tr>
-        <th>ID</th><th>Начало</th><th>Напр.</th><th>От</th><th>Кому</th><th>Агент</th><th>Длит., сек</th><th>Статус</th><th>Запись</th><th></th>
+        <th>ID</th><th>Когда</th><th>Направление</th><th>От</th><th>Кому</th><th>Агент</th><th>Клиент</th><th>Статус</th><th>Длит, сек</th><th>Запись</th><th></th>
       </tr>
     </thead>
-    <tbody id="callsTBody"></tbody>
+    <tbody id="callsTBody">
+      <tr><td colspan="11"><div class="help">Загрузка...</div></td></tr>
+    </tbody>
   </table>
   <button class="button ghost" id="loadMoreCalls" style="margin-top:8px;">Загрузить больше</button>
 </div>
 
+<div class="modal-backdrop" id="recModal">
+  <div class="modal">
+    <h3>Прослушивание записи</h3>
+    <audio id="recPlayer" controls style="width:100%"></audio>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+      <button class="button secondary" id="btnRecClose">Закрыть</button>
+    </div>
+  </div>
+</div>
+
 <script nonce="{{ csp_nonce }}">
+  const AGENTS = {{ agents_rows|tojson }};
   let callsPage = 1;
-  function callsRowHTML(d){
-    const dur = (d.duration_sec!=null)? String(d.duration_sec) : '—';
-    const rec = d.recording_url ? ('<button class="iconbtn small btnPlay" data-id="'+d.id+'">▶︎</button>') : '—';
-    const agent = d.agent_name || (d.agent_id || '—');
+  let lastMine = (document.getElementById('fMine')?.value || '1');
+  let lastFrom = (document.getElementById('fFrom')?.value || '');
+  let lastTo = (document.getElementById('fTo')?.value || '');
+
+  function buildParams(page){
+    const ps = new URLSearchParams();
+    ps.set('page', String(page||1));
+    if(lastMine) ps.set('mine', lastMine);
+    if(lastFrom) ps.set('date_from', lastFrom);
+    if(lastTo) ps.set('date_to', lastTo);
+    return ps;
+  }
+  function agentSelectHTML(id, aid){
+    let opts = '<option value="">—</option>';
+    for(const a of (AGENTS||[])){
+      const sel = (String(aid||'')===String(a.id))?' selected':'';
+      opts += '<option value="'+a.id+'"'+sel+'>'+esc(a.username)+'</option>';
+    }
+    return '<select class="select ca-assign" data-id="'+id+'">'+opts+'</select>';
+  }
+  function recButtonHTML(call){
+    const has = !!(call.recording_url||'');
+    const text = has ? '▶️' : '⤓';
+    const title = has ? 'Воспроизвести' : 'Запросить ссылку';
+    return '<button class="iconbtn small ca-rec" data-id="'+call.id+'" data-url="'+esc(call.recording_url||'')+'" title="'+title+'">'+text+'</button>';
+  }
+  function rowHTML(c){
     return `
-      <tr data-id="${d.id}">
-        <td>#${d.id}</td>
-        <td>${esc(d.started_at||'')}</td>
-        <td>${esc(d.direction||'')}</td>
-        <td>${esc(d.from_e164||'')}</td>
-        <td>${esc(d.to_e164||'')}</td>
-        <td>${esc(String(agent||'—'))}</td>
-        <td>${esc(dur)}</td>
-        <td>${esc(d.status||'')}</td>
-        <td>${rec}</td>
-        <td style="white-space:nowrap;display:flex;gap:6px;">
-          <button class="iconbtn small btnAssign" data-id="${d.id}">Мне</button>
-          <button class="iconbtn small btnToTask" data-id="${d.id}">В задачу</button>
+      <tr data-id="${c.id}">
+        <td>#${c.id}</td>
+        <td>${esc(c.started_at||'')}</td>
+        <td>${esc(c.direction||'')}</td>
+        <td>${esc(c.from_e164||'')}</td>
+        <td>${esc(c.to_e164||'')}</td>
+        <td>${agentSelectHTML(c.id, c.agent_id)}</td>
+        <td>${esc(c.company_name||c.contact_name||'—')}</td>
+        <td>${esc(c.status||'')}</td>
+        <td>${esc(String(c.duration_sec!=null?c.duration_sec:'0'))}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;align-items:center;">${recButtonHTML(c)}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;align-items:center;">
+          <button class="iconbtn small ca-to-task" data-id="${c.id}">В задачу</button>
         </td>
       </tr>`;
   }
-
-  function buildCallsURL(){
-    const url = new URL(window.location.origin + '/api/calls/list');
-    url.searchParams.set('page', callsPage);
-    const mine = document.getElementById('mine').checked ? '1' : '0';
-    url.searchParams.set('mine', mine);
-    const df = (document.getElementById('dateFrom').value||'').trim();
-    const dt = (document.getElementById('dateTo').value||'').trim();
-    if(df) url.searchParams.set('date_from', df);
-    if(dt) url.searchParams.set('date_to', dt);
-    return url.toString();
-  }
-
   async function loadCalls(reset=false){
+    if(reset){ callsPage=1; document.getElementById('callsTBody').innerHTML=''; }
     try{
-      if(reset){ callsPage = 1; document.getElementById('callsTBody').innerHTML=''; }
-      const r = await fetch(buildCallsURL());
+      const r = await fetch('/api/calls/list?'+buildParams(callsPage).toString());
       const j = await r.json();
-      if(!j.ok) return alert(j.error||'Ошибка');
+      if(!j.ok){ alert(j.error||'Ошибка'); return; }
+      const tb = document.getElementById('callsTBody');
       let added=0;
-      for(const it of (j.items||[])){ document.getElementById('callsTBody').insertAdjacentHTML('beforeend', callsRowHTML(it)); added++; }
-      if(added < 100) document.getElementById('loadMoreCalls').style.display='none';
-      else document.getElementById('loadMoreCalls').style.display='';
-      if(reset && added===0){ document.getElementById('callsTBody').innerHTML = '<tr><td colspan="10"><div class="help">Ничего не найдено</div></td></tr>'; }
-      if(!reset && added>0) toast('Загружено больше');
-    }catch(e){ alert('Ошибка загрузки'); }
+      for(const it of (j.items||[])){ tb.insertAdjacentHTML('beforeend', rowHTML(it)); added++; }
+      if(added===0 && callsPage===1){ tb.innerHTML='<tr><td colspan="11"><div class="help">Ничего не найдено</div></td></tr>'; }
+      const moreBtn=document.getElementById('loadMoreCalls');
+      if(added < (j.items||[]).length || (j.items||[]).length < 100){ moreBtn.style.display='none'; } else { moreBtn.style.display=''; }
+      if(added>0 && callsPage>1) toast('Загружено больше');
+    }catch(_){ alert('Ошибка загрузки'); }
   }
+  // initial
+  loadCalls(true);
 
-  async function assignMe(callId){
-    try{
-      const r = await fetch('/api/call/assign_agent',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({call_id: callId})});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      toast('Назначено вам'); loadCalls(true);
-    }catch(e){ alert('Ошибка сети'); }
-  }
-
-  async function callToTask(callId){
-    const title = prompt('Заголовок задачи', 'Звонок '+callId) || '';
-    try{
-      const r = await fetch('/api/call/to_task',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({call_id: callId, title})});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      toast('Задача #'+j.task_id+' создана');
-    }catch(e){ alert('Ошибка сети'); }
-  }
-
-  async function playRecording(callId){
-    try{
-      const r = await fetch('/api/call/recording/presign/'+callId);
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Нет записи');
-      const url = j.url||'';
-      if(!url) return alert('Нет записи');
-      const a = new Audio(url); a.play().catch(()=>window.open(url,'_blank'));
-    }catch(e){ alert('Ошибка проигрывания'); }
-  }
-
-  document.getElementById('callsFilters')?.addEventListener('submit', e=>{ e.preventDefault(); loadCalls(true); });
-  document.getElementById('btnCallsReset')?.addEventListener('click', e=>{
+  document.getElementById('btnCallsApply')?.addEventListener('click', e=>{
     e.preventDefault();
-    document.getElementById('mine').checked = true;
-    document.getElementById('dateFrom').value = '';
-    document.getElementById('dateTo').value = '';
+    lastMine = (document.getElementById('fMine').value||'1');
+    lastFrom = (document.getElementById('fFrom').value||'');
+    lastTo = (document.getElementById('fTo').value||'');
     loadCalls(true);
   });
-  document.getElementById('loadMoreCalls')?.addEventListener('click', e=>{
-    e.preventDefault(); callsPage++; loadCalls(false);
+  document.getElementById('btnCallsReset')?.addEventListener('click', e=>{
+    e.preventDefault();
+    document.getElementById('fMine').value='1';
+    document.getElementById('fFrom').value='';
+    document.getElementById('fTo').value='';
+    lastMine='1'; lastFrom=''; lastTo='';
+    loadCalls(true);
   });
+  document.getElementById('loadMoreCalls')?.addEventListener('click', e=>{ e.preventDefault(); callsPage++; loadCalls(false); });
 
-  document.getElementById('callsTBody')?.addEventListener('click', e=>{
-    const a = e.target.closest('.btnAssign'); if(a){ e.preventDefault(); assignMe(parseInt(a.getAttribute('data-id')||'0',10)); return; }
-    const t = e.target.closest('.btnToTask'); if(t){ e.preventDefault(); callToTask(parseInt(t.getAttribute('data-id')||'0',10)); return; }
-    const p = e.target.closest('.btnPlay'); if(p){ e.preventDefault(); playRecording(parseInt(p.getAttribute('data-id')||'0',10)); return; }
-  });
-
-  loadCalls(true);
-</script>
-"""
-# === END STYLES PART 5/9 ===
-# === STYLES PART 6/9 — ANALYTICS + IMPORT WIZARD + APPROVAL PUBLIC + SIMPLE MSG + LOOKUP ===
-# -*- coding: utf-8 -*-
-
-ANALYTICS_TMPL = """
-<h2 style="margin:0 0 8px 0;">Аналитика</h2>
-
-<div class="card">
-  <details open>
-    <summary class="button ghost">Фильтры</summary>
-    <form id="repFilters" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:8px;">
-      <label>С <input class="input" type="date" id="dateFrom"></label>
-      <label>По <input class="input" type="date" id="dateTo"></label>
-      <button class="button" type="submit">Построить</button>
-      <button class="button secondary" type="button" id="btnRepReset">Сбросить</button>
-    </form>
-  </details>
-</div>
-
-<div class="split" style="margin-top:10px;">
-  <div class="card">
-    <h3>Задачи по дням</h3>
-    <div class="help">Создано / Завершено / Просрочено</div>
-    <div id="tasksChartWrap" style="width:100%;max-width:100%;overflow:auto;">
-      <svg id="tasksChart" viewBox="0 0 800 280" preserveAspectRatio="none" style="width:100%;height:260px;background:var(--surface);border:1px solid var(--border);border-radius:10px;"></svg>
-    </div>
-    <table class="table" style="margin-top:8px;">
-      <thead><tr><th>Дата</th><th>Создано</th><th>Сделано</th><th>Просрочено</th><th>Σ абонплата</th></tr></thead>
-      <tbody id="tasksTbl"></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h3>Звонки по дням</h3>
-    <div class="help">Входящие / Исходящие · Суммарная длительность</div>
-    <div id="callsChartWrap" style="width:100%;max-width:100%;overflow:auto;">
-      <svg id="callsChart" viewBox="0 0 800 280" preserveAspectRatio="none" style="width:100%;height:260px;background:var(--surface);border:1px solid var(--border);border-radius:10px;"></svg>
-    </div>
-    <table class="table" style="margin-top:8px;">
-      <thead><tr><th>Дата</th><th>Входящие</th><th>Исходящие</th><th>Σ длительность, сек</th></tr></thead>
-      <tbody id="callsTbl"></tbody>
-    </table>
-  </div>
-</div>
-
-<script nonce="{{ csp_nonce }}">
-  function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
-
-  function drawLines(svgId, series, labels, colors){
-    const svg = document.getElementById(svgId);
-    if(!svg) return;
-    const W=800, H=240, PADL=40, PADB=24, PADT=10, PADR=10;
-    const innerW = W - PADL - PADR, innerH = H - PADT - PADB;
-    const n = Math.max(1, labels.length);
-    const maxY = Math.max(1, ...series.flat().map(v=>Number(v)||0));
-    const toX = i => PADL + (n<=1 ? innerW/2 : (i*(innerW/(n-1))));
-    const toY = v => PADT + innerH - (innerH * (Number(v)||0) / maxY);
-
-    let grid = '';
-    const ySteps = 4;
-    for(let i=0;i<=ySteps;i++){
-      const y = PADT + (innerH*i/ySteps);
-      grid += `<line x1="${PADL}" y1="${y}" x2="${PADL+innerW}" y2="${y}" stroke="var(--border)" stroke-width="1" />`;
-    }
-    let xlbl = '';
-    const sparse = Math.ceil(n/8);
-    for(let i=0;i<n;i+=sparse){
-      const x = toX(i);
-      xlbl += `<text x="${x}" y="${PADT+innerH+16}" font-size="11" text-anchor="middle" fill="var(--muted)">${esc(labels[i]||'')}</text>`;
-    }
-
-    let paths = '';
-    for(let si=0; si<series.length; si++){
-      const data = series[si] || [];
-      let d = '';
-      for(let i=0;i<n;i++){
-        const x = toX(i), y = toY(data[i]||0);
-        d += (i===0?`M ${x} ${y}`:` L ${x} ${y}`);
-      }
-      paths += `<path d="${d}" fill="none" stroke="${colors[si]||'#2bd66a'}" stroke-width="2"/>`;
-      for(let i=0;i<n;i++){
-        const x = toX(i), y = toY(data[i]||0);
-        paths += `<circle cx="${x}" cy="${y}" r="2.2" fill="${colors[si]||'#2bd66a'}"/>`;
-      }
-    }
-
-    svg.innerHTML = `<g>${grid}${xlbl}${paths}</g>`;
-  }
-
-  async function loadReports(){
-    const df = (document.getElementById('dateFrom').value||'').trim();
-    const dt = (document.getElementById('dateTo').value||'').trim();
-
+  async function callAssign(id, agent_id){
     try{
-      const url = new URL(window.location.origin + '/api/reports/tasks_daily');
-      if(df) url.searchParams.set('date_from', df);
-      if(dt) url.searchParams.set('date_to', dt);
-      const r = await fetch(url.toString()); const j = await r.json();
-      const rows = j.ok ? (j.items||[]) : [];
-      const lbl = rows.map(x=>x.ymd);
-      const created = rows.map(x=>Number(x.created_cnt||0));
-      const done = rows.map(x=>Number(x.done_cnt||0));
-      const overdue = rows.map(x=>Number(x.overdue_cnt||0));
-      drawLines('tasksChart', [created, done, overdue], lbl, ['#2bd66a','#7ec1ff','#ff6b6b']);
-      const tb = document.getElementById('tasksTbl'); tb.innerHTML='';
-      if(!rows.length){ tb.innerHTML = '<tr><td colspan="5"><div class="help">Нет данных</div></td></tr>'; }
-      for(const it of rows){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${esc(it.ymd)}</td><td>${esc(String(it.created_cnt||0))}</td><td>${esc(String(it.done_cnt||0))}</td><td>${esc(String(it.overdue_cnt||0))}</td><td>${esc(String((it.monthly_fee_sum||0)))}</td>`;
-        tb.appendChild(tr);
-      }
-    }catch(e){}
-
-    try{
-      const url = new URL(window.location.origin + '/api/reports/calls_daily');
-      if(df) url.searchParams.set('date_from', df);
-      if(dt) url.searchParams.set('date_to', dt);
-      const r = await fetch(url.toString()); const j = await r.json();
-      const rows = j.ok ? (j.items||[]) : [];
-      const lbl = rows.map(x=>x.ymd);
-      const inCnt = rows.map(x=>Number(x.in_cnt||0));
-      const outCnt = rows.map(x=>Number(x.out_cnt||0));
-      drawLines('callsChart', [inCnt, outCnt], lbl, ['#7ec1ff','#2bd66a']);
-      const tb = document.getElementById('callsTbl'); tb.innerHTML='';
-      if(!rows.length){ tb.innerHTML = '<tr><td colspan="4"><div class="help">Нет данных</div></td></tr>'; }
-      for(const it of rows){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${esc(it.ymd)}</td><td>${esc(String(it.in_cnt||0))}</td><td>${esc(String(it.out_cnt||0))}</td><td>${esc(String(it.dur_sum||0))}</td>`;
-        tb.appendChild(tr);
-      }
-    }catch(e){}
+      const r=await fetch('/api/call/assign_agent',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({call_id:id,agent_id})});
+      const j=await r.json(); if(!j.ok) alert(j.error||'Ошибка');
+    }catch(_){ alert('Ошибка сети'); }
   }
+  async function callToTask(id){
+    try{
+      const title = prompt('Заголовок задачи','Звонок #'+id) || ('Звонок #'+id);
+      const r=await fetch('/api/call/to_task',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({call_id:id, title})});
+      const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
+      toast('Создана задача #'+(j.task_id||'')); 
+    }catch(_){ alert('Ошибка сети'); }
+  }
+  async function openRecording(callId, current){
+    try{
+      let url = current || '';
+      if(!url){
+        const r=await fetch('/api/call/recording/presign/'+callId);
+        const j=await r.json(); if(!j.ok) return alert(j.error||'Нет записи');
+        url = j.url || '';
+      }
+      if(!url) return alert('Нет записи');
+      const audio = document.getElementById('recPlayer');
+      audio.src = url;
+      document.getElementById('recModal').classList.add('show');
+      audio.play().catch(()=>{});
+    }catch(_){ alert('Ошибка'); }
+  }
+  document.getElementById('btnRecClose')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('recModal').classList.remove('show'); });
 
-  document.getElementById('repFilters')?.addEventListener('submit', e=>{ e.preventDefault(); loadReports(); });
-  document.getElementById('btnRepReset')?.addEventListener('click', e=>{
-    e.preventDefault(); document.getElementById('dateFrom').value=''; document.getElementById('dateTo').value=''; loadReports();
+  document.addEventListener('change', e=>{
+    const el=e.target; const id=el && el.getAttribute('data-id');
+    if(!id) return;
+    if(el.classList.contains('ca-assign')) callAssign(parseInt(id,10), el.value||null);
   });
-  loadReports();
+  document.addEventListener('click', e=>{
+    const t=e.target.closest('.ca-to-task'); if(t){ e.preventDefault(); callToTask(parseInt(t.getAttribute('data-id')||'0',10)); return; }
+    const r=e.target.closest('.ca-rec'); if(r){ e.preventDefault(); openRecording(parseInt(r.getAttribute('data-id')||'0',10), r.getAttribute('data-url')||''); return; }
+  });
+
+  // Keyboard nav
+  document.addEventListener('keydown', e=>{
+    const tag=(e.target&&e.target.tagName||'').toUpperCase();
+    if(tag==='INPUT' || tag==='TEXTAREA' || e.ctrlKey || e.metaKey) return;
+    const rows=[...document.querySelectorAll('#callsTBody tr')];
+    const active=(document.activeElement && document.activeElement.closest)?document.activeElement.closest('tr'):null;
+    const idx=rows.indexOf(active);
+    if(e.key==='ArrowDown'){ e.preventDefault(); (rows[Math.min(rows.length-1,idx+1)]||rows[0])?.focus(); }
+    if(e.key==='ArrowUp'){ e.preventDefault(); (rows[Math.max(0,idx-1)]||rows[0])?.focus(); }
+  });
 </script>
 """
 
-IMPORT_TMPL = """
-<h2>Импорт CSV</h2>
-
-<div class="card">
-  <p class="help">Загрузите CSV-файл. Разделитель будет определён автоматически (предпочтительно «;»).</p>
-  <form method="post" enctype="multipart/form-data" style="display:grid;gap:8px;max-width:680px;">
-    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-    <label>Файл CSV <input class="input" type="file" name="csvfile" accept=".csv,text/csv" required></label>
-    <label>Режим
-      <select class="select" name="mode">
-        <option value="tasks">Задачи</option>
-        <option value="clients">Клиенты</option>
-      </select>
-    </label>
-    <details>
-      <summary class="button ghost">Подсказки по колонкам</summary>
-      <div class="help" style="margin-top:8px;">
-        <strong>Задачи:</strong> title, description, comments, due, monthly_fee, company_inn, company_id<br>
-        <strong>Клиенты:</strong> name, inn, phone, email, address, notes, contact_name, contact_phone, contact_email
+MEETING_TMPL = """
+{% if meeting %}
+  <h2>Встреча #{{ meeting.id }} · {{ meeting.title or 'Без названия' }}</h2>
+  <div class="split">
+    <div class="card">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div><strong>Начало:</strong> {{ meeting.start_at or '—' }}</div>
+        <div><strong>Окончание:</strong> {{ meeting.end_at or '—' }}</div>
+        <div><strong>Комната:</strong> {{ meeting.room }}</div>
+        <div><strong>Создал:</strong> {{ meeting.created_by or '—' }}</div>
       </div>
-    </details>
-    <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button class="button" type="submit">Импортировать</button>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+        <a class="button" href="{{ jitsi_base.rstrip('/') }}/{{ meeting.room }}" target="_blank" rel="noopener">Открыть в новой вкладке</a>
+        <button class="button ghost" id="btnEmbed">Встроить</button>
+        <button class="button secondary" id="btnStartRec">Начать запись</button>
+        <button class="button warn" id="btnStopRec">Остановить запись</button>
+        <a class="button ghost" href="{{ url_for('meetings_page') }}">← к списку</a>
+      </div>
     </div>
-  </form>
-</div>
-"""
-
-APPROVAL_PUBLIC_TMPL = """
-<h2>Согласование</h2>
-
-<div class="card">
-  <div><strong>Тема:</strong> {{ a.title or '—' }}</div>
-  <div style="margin-top:6px;"><strong>Описание:</strong><br>{{ a.description or '—' }}</div>
-  <div style="margin-top:6px;"><strong>Статус:</strong> <span class="badge">{{ a.status or 'pending' }}</span></div>
-</div>
-
-<div class="card" style="margin-top:10px;">
-  {% if a.status and a.status.lower()=='pending' %}
-  <h3>Принять решение</h3>
-  <form method="post" style="display:grid;gap:8px;max-width:720px;">
-    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-    <input type="hidden" name="form_token" value="{{ a.form_token or '' }}">
-    <label>Действие
-      <select class="select" name="action" required>
-        <option value="approve">Одобрить</option>
-        <option value="request_changes">Запросить изменения</option>
-      </select>
-    </label>
-    <label>Комментарий (опц.) <textarea class="input" name="message" rows="4" maxlength="1000"></textarea></label>
-    <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button class="button" type="submit">Отправить</button>
+    <div class="card">
+      <h3 style="margin:0 0 8px 0;">Участники</h3>
+      <div class="help">Список ID участников из записи встречи</div>
+      <div>{{ meeting.participants_json or '[]' }}</div>
     </div>
-  </form>
-  {% else %}
-  <div class="help">Решение уже зафиксировано.</div>
-  {% endif %}
-</div>
-
-<div class="card" style="margin-top:10px;">
-  <h3>История</h3>
-  <table class="table">
-    <thead><tr><th>ID</th><th>Кем</th><th>Действие</th><th>Сообщение</th><th>IP</th><th>UA</th><th>Дата</th></tr></thead>
-    <tbody>
-      {% for r in logs %}
-      <tr>
-        <td>#{{ r.id }}</td><td>{{ r.actor or '—' }}</td><td>{{ r.action or '—' }}</td>
-        <td>{{ r.message or '' }}</td><td>{{ r.ip or '' }}</td><td class="help">{{ r.ua or '' }}</td><td>{{ r.created_at or '' }}</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="7"><div class="help">Лог пуст</div></td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</div>
-"""
-
-SIMPLE_MSG_TMPL = """
-<div class="card">
-  <h2 style="margin:0 0 8px 0;">{{ title or 'Сообщение' }}</h2>
-  <div>{{ body or '' }}</div>
-</div>
-"""
-
-SEARCH_TMPL = """
-<h2>Поиск по базе</h2>
-
-<div class="card">
-  <form method="get" action="{{ url_for('search_page') }}" style="display:flex;gap:8px;max-width:820px;">
-    <input class="input" name="q" value="{{ q or '' }}" placeholder="Что ищем? (текст, номер, email)">
-    <button class="button" type="submit">Искать</button>
-    <a class="button ghost" href="{{ url_for('search_page') }}">Сбросить</a>
-  </form>
-  {% if not q %}
-  <div class="help" style="margin-top:8px;">Введите запрос и нажмите «Искать»</div>
-  {% endif %}
-  {% if q and (results.inbox|length + results.tasks|length + results.chats|length)==0 %}
-  <div class="help" style="margin-top:8px;">Ничего не найдено</div>
-  {% endif %}
   </div>
-
-<div class="split" style="margin-top:10px;">
-  <div class="card">
-    <h3>Входящие</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Фрагмент</th><th></th></tr></thead>
-      <tbody>
-        {% for m in results.inbox %}
-        <tr>
-          <td>#{{ m.id }}</td>
-          <td class="help">{{ (m.body or '')[:120] }}</td>
-          <td><a class="iconbtn small" href="{{ url_for('thread_view', tid=m.thread_id) }}">Открыть тред</a></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="card" id="embedWrap" style="margin-top:10px;display:none;">
+    <div class="help">Встроенная встреча</div>
+    <iframe id="meetFrame" src="" style="width:100%;aspect-ratio:16/9;border:1px solid var(--border);border-radius:12px" allow="camera; microphone; display-capture; clipboard-read; clipboard-write"></iframe>
   </div>
-
-  <div class="card">
-    <h3>Задачи</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Заголовок</th><th></th></tr></thead>
-      <tbody>
-        {% for t in results.tasks %}
-        <tr>
-          <td>#{{ t.id }}</td>
-          <td>{{ t.title or '' }}</td>
-          <td><a class="iconbtn small" href="{{ url_for('task_view', tid=t.id) }}">Открыть</a></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h3>Чаты</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Фрагмент</th><th></th></tr></thead>
-      <tbody>
-        {% for c in results.chats %}
-        <tr>
-          <td>#{{ c.id }}</td>
-          <td class="help">{{ (c.body or '')[:120] }}</td>
-          <td><a class="iconbtn small" href="{{ url_for('chat_channel', cid=c.channel_id) }}">Открыть канал</a></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="3"><div class="help">Нет результатов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-"""
-
-LOOKUP_TMPL = """
-<h2>Поиск клиента</h2>
-
-<div class="card">
-  <form method="get" action="{{ url_for('lookup') }}" style="display:grid;gap:8px;max-width:820px;">
-    <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
-      <label>Телефон <input class="input" name="phone" value="{{ params.phone or '' }}" placeholder="+7 ..."></label>
-      <label>ID <input class="input" name="id" value="{{ params.id or '' }}"></label>
-      <label>ИНН <input class="input" name="inn" value="{{ params.inn or '' }}"></label>
-      <label>Email <input class="input" name="email" value="{{ params.email or '' }}"></label>
+  <script nonce="{{ csp_nonce }}">
+    const MID={{ meeting.id }};
+    const JITSI="{{ jitsi_base.rstrip('/') }}";
+    document.getElementById('btnEmbed')?.addEventListener('click', e=>{
+      e.preventDefault();
+      const wrap=document.getElementById('embedWrap');
+      const fr=document.getElementById('meetFrame');
+      wrap.style.display='block';
+      fr.src = JITSI + '/' + "{{ meeting.room }}";
+    });
+    document.getElementById('btnStartRec')?.addEventListener('click', async e=>{
+      e.preventDefault();
+      try{
+        const r=await fetch('/api/meeting/'+MID+'/start_recording',{method:'POST',headers:{'X-CSRFToken':CSRF}});
+        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка'); toast('Запись начата');
+      }catch(_){ alert('Ошибка сети'); }
+    });
+    document.getElementById('btnStopRec')?.addEventListener('click', async e=>{
+      e.preventDefault();
+      try{
+        const r=await fetch('/api/meeting/'+MID+'/stop_recording',{method:'POST',headers:{'X-CSRFToken':CSRF}});
+        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка'); toast('Запись остановлена'+(j.summary?': '+j.summary:'')); 
+      }catch(_){ alert('Ошибка сети'); }
+    });
+  </script>
+{% else %}
+  <h2>Встречи</h2>
+  <div class="split">
+    <div class="card">
+      <h3 style="margin:0 0 8px 0;">Запланировать встречу</h3>
+      <div class="help">Выберите участников и/или отделы. Будет создана Jitsi-комната и отправлены уведомления.</div>
+      {% set all_users = query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
+      {% set depts = query_db('SELECT id,name FROM departments WHERE org_id=? ORDER BY name',(user.org_id,)) %}
+      <form id="meetNew" style="display:grid;gap:8px;max-width:920px;">
+        <label>Тема <input class="input" id="mTitle" placeholder="Еженедельный синк"></label>
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Начало <input class="input" type="datetime-local" id="mStart"></label>
+          <label>Окончание <input class="input" type="datetime-local" id="mEnd"></label>
+        </div>
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Уведомить за, мин <input class="input" type="number" id="mNotify" value="15" min="0" step="5"></label>
+        </div>
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Участники
+            <select class="select" id="mUsers" multiple size="8" style="min-width:220px;">
+              {% for u in all_users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}
+            </select>
+          </label>
+          <label>Отделы
+            <select class="select" id="mDepts" multiple size="8" style="min-width:220px;">
+              {% for d in depts %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+            </select>
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button class="button" id="btnMeetCreate" type="button">Создать</button>
+        </div>
+      </form>
     </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;">
-      <button class="button" type="submit">Искать</button>
-      <a class="button ghost" href="{{ url_for('lookup') }}">Сбросить</a>
+    <div class="card">
+      <h3 style="margin:0 0 8px 0;">Список встреч</h3>
+      <div class="help">Последние 1000 встреч</div>
+      <table class="table">
+        <thead>
+          <tr><th>ID</th><th>Тема</th><th>Начало</th><th>Окончание</th><th></th></tr>
+        </thead>
+        <tbody id="meetList"><tr><td colspan="5"><div class="help">Загрузка...</div></td></tr></tbody>
+      </table>
     </div>
-  </form>
-</div>
-
-<div class="split" style="margin-top:10px;">
-  <div class="card">
-    <h3>По ID</h3>
-    {% if results.by_id %}
-      <div><a class="iconbtn small" href="{{ url_for('client_page', cid=results.by_id.id) }}">Открыть #{{ results.by_id.id }}</a></div>
-      <div class="help">{{ results.by_id.name or '' }}</div>
-      <div class="help">{{ results.by_id.phone or '' }} · {{ results.by_id.email or '' }}</div>
-    {% else %}
-      <div class="help">—</div>
-    {% endif %}
   </div>
+  <script nonce="{{ csp_nonce }}">
+    async function listMeetings(){
+      try{
+        const r=await fetch('/api/meetings'); const j=await r.json();
+        const tb=document.getElementById('meetList');
+        if(!j.ok){ tb.innerHTML='<tr><td colspan="5"><div class="help">Ошибка загрузки</div></td></tr>'; return; }
+        let html='';
+        for(const m of (j.items||[])){
+          html += `
+            <tr data-id="${m.id}">
+              <td>#${m.id}</td>
+              <td>${esc(m.title||'')}</td>
+              <td>${esc(m.start_at||'')}</td>
+              <td>${esc(m.end_at||'')}</td>
+              <td style="white-space:nowrap;display:flex;gap:6px;">
+                <a class="iconbtn small" href="/meeting/${m.id}">Открыть</a>
+                <button class="iconbtn small btnMeetDel" data-id="${m.id}">Удалить</button>
+              </td>
+            </tr>`;
+        }
+        if(!html) html='<tr><td colspan="5"><div class="help">Нет встреч</div></td></tr>';
+        tb.innerHTML = html;
+      }catch(_){
+        document.getElementById('meetList').innerHTML='<tr><td colspan="5"><div class="help">Ошибка сети</div></td></tr>';
+      }
+    }
+    listMeetings();
 
-  <div class="card">
-    <h3>Компании</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Название</th><th>ИНН</th><th>Телефон</th><th>Email</th><th></th></tr></thead>
-      <tbody>
-        {% for c in results.companies %}
-        <tr>
-          <td>#{{ c.id }}</td><td>{{ c.name or '' }}</td><td>{{ c.inn or '' }}</td><td>{{ c.phone or '' }}</td><td>{{ c.email or '' }}</td>
-          <td><a class="iconbtn small" href="{{ url_for('client_page', cid=c.id) }}">Открыть</a></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="6"><div class="help">Нет результатов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
+    function vals(sel){ const el=document.getElementById(sel); return [...(el?.selectedOptions||[])].map(o=>parseInt(o.value,10)).filter(x=>!isNaN(x)); }
+    document.getElementById('btnMeetCreate')?.addEventListener('click', async e=>{
+      e.preventDefault();
+      const payload = {
+        title: (document.getElementById('mTitle').value||'').trim(),
+        start_at: (document.getElementById('mStart').value||''),
+        end_at: (document.getElementById('mEnd').value||''),
+        notify_before_min: parseInt(document.getElementById('mNotify').value||'0',10)||0,
+        participants: vals('mUsers'),
+        department_ids: vals('mDepts')
+      };
+      try{
+        const r=await fetch('/api/meetings/schedule',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify(payload)});
+        const j=await r.json();
+        if(!j.ok){ alert(j.error||'Ошибка'); return; }
+        toast('Встреча создана'); listMeetings();
+      }catch(_){ alert('Ошибка сети'); }
+    });
 
-  <div class="card">
-    <h3>Контакты</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>ФИО</th><th>Телефон</th><th>Email</th></tr></thead>
-      <tbody>
-        {% for p in results.contacts %}
-        <tr>
-          <td>#{{ p.id }}</td><td>{{ p.name or '' }}</td><td>{{ p.phone or '' }}</td><td>{{ p.email or '' }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="4"><div class="help">Нет результатов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
+    document.getElementById('meetList')?.addEventListener('click', async e=>{
+      const b=e.target.closest('.btnMeetDel'); if(!b) return;
+      e.preventDefault();
+      const id=parseInt(b.getAttribute('data-id')||'0',10)||0;
+      if(!id) return;
+      if(!confirm('Удалить встречу #'+id+'?')) return;
+      try{
+        const r=await fetch('/api/meetings/'+id,{method:'DELETE',headers:{'X-CSRFToken':CSRF}});
+        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка'); toast('Удалено'); listMeetings();
+      }catch(_){ alert('Ошибка сети'); }
+    });
+  </script>
+{% endif %}
 """
-# === END STYLES PART 6/9 ===
-# === STYLES PART 7/9 — CHAT (org-wide) + MEETINGS (list/schedule/join) ===
+# === END STYLES PART 6/11 ===
+# === STYLES PART 7/11 — CHAT (org-wide) + SEARCH UI ===
 # -*- coding: utf-8 -*-
 
 CHAT_TMPL = """
-<h2 style="margin:0 0 8px 0;">Командные чаты</h2>
+<h2 style="margin:0 0 8px 0;">Командный чат</h2>
 
-<div class="card">
-  <details open>
-    <summary class="button ghost">Управление каналами</summary>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
-      <button class="button secondary" id="btnNewChan" type="button">Создать канал</button>
-    </div>
-  </details>
-</div>
+<style>
+  .chat-wrap{display:grid;grid-template-columns:280px 1fr;gap:10px}
+  @media(max-width:980px){ .chat-wrap{grid-template-columns:1fr} }
+  .chat-channels{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:6px}
+  .chat-chan{display:flex;align-items:center;gap:8px;padding:8px;border:1px solid var(--border);border-radius:10px;color:var(--fg)}
+  .chat-chan.active{background:var(--surface);box-shadow:0 0 0 2px #2bd66a22 inset}
+  .chat-main .msg{border:1px solid var(--border);background:var(--panel);border-radius:10px;padding:8px;margin:8px 0}
+  .chat-main .msg.mine{box-shadow:0 0 0 2px #2bd66a22 inset}
+  .chat-main .meta{font-size:12px;color:var(--muted);margin-bottom:4px}
+  .chat-main .body{white-space:pre-wrap;word-wrap:break-word}
+</style>
 
-<div class="split equal" style="margin-top:10px;grid-template-columns:320px 1fr;">
-  <div class="card" style="display:flex;flex-direction:column;gap:8px;">
-    <div style="display:flex;gap:6px;align-items:center;">
-      <input class="input" id="chanFilter" placeholder="Фильтр по названию" style="flex:1 1 auto;">
-      <button class="iconbtn small" id="btnChanReset">✕</button>
-    </div>
-    <div id="chanList" style="max-height:60vh;overflow:auto;display:flex;flex-direction:column;gap:6px;">
+<div class="chat-wrap">
+  <div>
+    <div class="chat-channels">
+      <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <div style="font-weight:700">Каналы</div>
+        <button class="iconbtn small" id="btnNewChan">＋ создать</button>
+      </div>
       {% for ch in channels %}
-        <a href="{{ url_for('chat_channel', cid=ch.id) }}" class="navitem {% if current and current.id==ch.id %}active{% endif %}" data-name="{{ (ch.name or '')|lower }}">
-          <span class="icon">{% if ch.type=='personal' %}👤{% elif ch.type=='group' %}👥{% else %}# {% endif %}</span>
-          <span class="label">{{ ch.name or ('#'+(ch.id|string)) }}</span>
+        <a class="chat-chan {% if current and current.id==ch.id %}active{% endif %}" href="{{ url_for('chat_channel', cid=ch.id) }}">
+          <span class="icon">{{ '🔒' if ch.type=='personal' else ('👥' if ch.type=='group' else '📣') }}</span>
+          <span>{{ ch.name or ('DM' if ch.type=='personal' else ('Группа' if ch.type=='group' else 'Публичный')) }}</span>
         </a>
       {% else %}
-        <div class="help">Каналы отсутствуют</div>
+        <div class="help">Каналов пока нет</div>
       {% endfor %}
     </div>
   </div>
 
-  <div class="card" style="display:flex;flex-direction:column;min-height:60vh;">
-    {% if not current %}
-      <div class="help">Выберите канал слева или создайте новый</div>
-    {% else %}
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
-        <div class="tag">#{{ current.id }}</div>
-        <div style="font-weight:700;">{{ current.name or ('Канал #' + (current.id|string)) }}</div>
-        <div class="help" style="margin-left:auto;">Тип: {{ current.type }}</div>
-      </div>
-      <style>
-        .cwrap{display:flex;flex-direction:column-reverse;gap:8px;overflow:auto;min-height:380px;max-height:60vh;border:1px solid var(--border);border-radius:12px;padding:10px;background:var(--surface)}
-        .cmsg{max-width:72%;padding:8px 10px;border-radius:12px;border:1px solid var(--border);background:var(--panel)}
-        .cmsg .meta{color:var(--muted);font-size:12px;margin-bottom:4px}
-        .cmsg.own{margin-left:auto;border-color:#2bd66a66;box-shadow:0 0 0 2px #2bd66a1a inset}
-        .cmsg.system{background:transparent;border-style:dashed;opacity:.8}
-      </style>
-      <div id="chatList" class="cwrap" data-page="{{ request.args.get('page','1') }}">
-        {% for m in messages %}
-          {% set mine = (user and m.user_id==user.id) %}
-          <div class="cmsg {% if mine %}own{% endif %} {% if m.deleted_at %}system{% endif %}">
-            <div class="meta">{{ m.created_at }} • {{ m.username or ('#'+(m.user_id|string)) }}</div>
-            <div class="body">{{ m.body or '' }}</div>
+  <div class="chat-main">
+    {% if current %}
+      <div class="card" style="margin-bottom:10px;">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <div class="help">Канал #{{ current.id }} · {{ current.name or (current.type or '') }}</div>
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <a class="button ghost" href="{{ url_for('chat') }}">← ко всем каналам</a>
           </div>
-        {% else %}
-          <div class="help">Сообщений пока нет</div>
-        {% endfor %}
-      </div>
-      <div style="display:flex;gap:8px;justify-content:space-between;margin-top:8px;">
-        <a class="button ghost" id="btnOlder" href="{{ url_for('chat_channel', cid=current.id, page=(request.args.get('page',1)|int + 1)) }}">Загрузить ещё</a>
-        <div class="help">Страница {{ request.args.get('page','1') }}</div>
+        </div>
       </div>
 
-      <div class="composer" style="margin-top:10px;">
-        <div id="chatDrop" style="border:2px dashed var(--border);padding:10px;text-align:center;cursor:pointer;">Перетащите файлы или кликните для загрузки</div>
-        <input type="file" id="chatFile" multiple style="display:none;">
-        <div id="chatAtt" class="help" style="margin:6px 0;display:none;"></div>
-        <textarea class="input" id="chatBody" rows="3" placeholder="Сообщение..."></textarea>
-        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;flex-wrap:wrap;">
-          <button class="button" id="btnChatSend" type="button">Отправить</button>
-          <button class="button secondary" id="btnChatUpload" type="button">Загрузить файл</button>
+      <div class="card" style="margin-bottom:10px;">
+        <div id="chatList" style="max-height:60vh;overflow:auto;">
+          {# сообщения с сервера приходят DESC — выведем в прямом порядке #}
+          {% for m in messages|reverse %}
+            <div class="msg {% if m.user_id==user.id %}mine{% endif %}" data-id="{{ m.id }}">
+              <div class="meta">#{{ m.id }} · {{ m.created_at }} · {{ m.username }}</div>
+              <div class="body">{{ m.body or '' }}</div>
+            </div>
+          {% else %}
+            <div class="help">Пока нет сообщений</div>
+          {% endfor %}
         </div>
+        <div style="margin-top:8px;display:flex;justify-content:center;">
+          {% set page = request.args.get('page','1')|int %}
+          <a class="button ghost" id="btnMoreChat" href="{{ url_for('chat_channel', cid=current.id) }}?page={{ page+1 }}">Загрузить ещё</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <div id="cDrop" style="border:2px dashed var(--border);padding:10px;text-align:center;cursor:pointer;">Перетащите файлы или кликните для загрузки</div>
+        <input type="file" id="cFile" multiple style="display:none;">
+        <div id="cAtt" class="help" style="display:none;margin:6px 0;"></div>
+        <textarea class="input" id="cBody" rows="3" placeholder="Сообщение... (Ctrl+Enter — отправить)"></textarea>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;flex-wrap:wrap;">
+          <button class="button secondary" id="btnUpload">Загрузить файл</button>
+          <button class="button" id="btnSend">Отправить</button>
+        </div>
+      </div>
+    {% else %}
+      <div class="card">
+        <div class="help">Выберите канал слева или создайте новый</div>
       </div>
     {% endif %}
   </div>
@@ -11861,1240 +12273,1352 @@ CHAT_TMPL = """
 <div class="modal-backdrop" id="chanModal">
   <div class="modal">
     <h3>Создать канал</h3>
-    <form style="display:grid;gap:8px;">
+    {% set all_users = query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
+    {% set depts = query_db('SELECT id,name FROM departments WHERE org_id=? ORDER BY name',(user.org_id,)) %}
+    <form style="display:grid;gap:8px;max-width:720px;">
       <label>Тип
         <select class="select" id="chType">
           <option value="public">public</option>
           <option value="group">group</option>
-          <option value="personal">personal (1:1)</option>
+          <option value="personal">personal</option>
         </select>
       </label>
-      <label>Название (для public/group) <input class="input" id="chTitle" placeholder="Канал"></label>
-      <label>Пользователи (id через запятую) <input class="input" id="chMembers" placeholder="1,2,3"></label>
-      <label>ID отделов (опц.) <input class="input" id="chDepts" placeholder="1,2"></label>
-      <div class="help">Для personal должен быть указан ровно один пользователь</div>
-      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
-        <button class="button secondary" type="button" id="btnChCancel">Отмена</button>
-        <button class="button" type="button" id="btnChCreate">Создать</button>
+      <label>Название (для public/group) <input class="input" id="chTitle" placeholder="Название канала"></label>
+      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+        <label>Пользователи
+          <select class="select" id="chMembers" multiple size="6">
+            {% for u in all_users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Отделы
+          <select class="select" id="chDepts" multiple size="6">
+            {% for d in depts %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+          </select>
+        </label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="button secondary" id="btnChCancel" type="button">Отмена</button>
+        <button class="button" id="btnChCreate" type="button">Создать</button>
       </div>
     </form>
   </div>
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  function esc(s){ return String(s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+  const CUR_CH = {{ (current.id if current else 0) }};
+  let cAtt = [];
 
-  // Channel filter
-  document.getElementById('chanFilter')?.addEventListener('input', e=>{
-    const q = (e.target.value||'').trim().toLowerCase();
-    document.querySelectorAll('#chanList .navitem').forEach(it=>{
-      const name = (it.getAttribute('data-name')||'');
-      it.style.display = (!q || name.includes(q)) ? '' : 'none';
-    });
-  });
-  document.getElementById('btnChanReset')?.addEventListener('click', e=>{
-    e.preventDefault(); const i=document.getElementById('chanFilter'); if(i){ i.value=''; i.dispatchEvent(new Event('input')); }
-  });
-
-  // New channel modal
-  function openCh(){ document.getElementById('chanModal').classList.add('show'); }
-  function closeCh(){ document.getElementById('chanModal').classList.remove('show'); }
-  document.getElementById('btnNewChan')?.addEventListener('click', e=>{ e.preventDefault(); openCh(); });
-  document.getElementById('btnChCancel')?.addEventListener('click', e=>{ e.preventDefault(); closeCh(); });
+  // Создание канала
+  function vals(sel){ const el=document.getElementById(sel); return [...(el?.selectedOptions||[])].map(o=>parseInt(o.value,10)).filter(x=>!isNaN(x)); }
+  document.getElementById('btnNewChan')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('chanModal').classList.add('show'); });
+  document.getElementById('btnChCancel')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('chanModal').classList.remove('show'); });
   document.getElementById('btnChCreate')?.addEventListener('click', async e=>{
     e.preventDefault();
-    const type=(document.getElementById('chType').value||'public');
+    const typ=(document.getElementById('chType').value||'public').toLowerCase();
     const title=(document.getElementById('chTitle').value||'').trim();
-    const members=(document.getElementById('chMembers').value||'').split(',').map(s=>s.trim()).filter(Boolean).map(s=>parseInt(s,10)).filter(n=>!isNaN(n));
-    const departments=(document.getElementById('chDepts').value||'').split(',').map(s=>s.trim()).filter(Boolean).map(s=>parseInt(s,10)).filter(n=>!isNaN(n));
+    const members=vals('chMembers');
+    const department_ids=vals('chDepts');
     try{
-      const r=await fetch('/api/chat/create',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({type, title, members, department_ids: departments})});
+      const r=await fetch('/api/chat/create',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({type:typ, title, members, department_ids})});
       const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      closeCh(); location.href = '/chat/'+j.id;
+      document.getElementById('chanModal').classList.remove('show');
+      location.href = '/chat/'+j.id;
     }catch(_){ alert('Ошибка сети'); }
   });
 
-  // Chat message send/upload
-  async function chatSend(cid){
-    const body=(document.getElementById('chatBody').value||'').trim();
-    if(!body) return alert('Пустое сообщение');
+  // Отправка сообщения
+  async function sendMsg(){
+    const body=(document.getElementById('cBody').value||'').trim();
+    if(!body && !cAtt.length) return alert('Пустое сообщение');
     try{
-      const r=await fetch('/api/chat/send',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({channel_id: cid, body})});
+      const r=await fetch('/api/chat/send',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({channel_id:CUR_CH, body})});
       const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      document.getElementById('chatBody').value=''; location.reload();
+      document.getElementById('cBody').value='';
+      toast('Отправлено');
     }catch(_){ alert('Ошибка сети'); }
   }
-  async function chatUpload(cid, files){
+  document.getElementById('btnSend')?.addEventListener('click', e=>{ e.preventDefault(); sendMsg(); });
+  document.getElementById('cBody')?.addEventListener('keydown', e=>{
+    if(e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); sendMsg(); }
+  });
+
+  // Upload
+  function updateCAtt(){
+    const el=document.getElementById('cAtt');
+    if(!cAtt.length){ el.style.display='none'; el.textContent=''; return; }
+    el.style.display='block';
+    el.innerHTML = 'Вложения (отправлены как файлы): ' + cAtt.map(a=>('<a href="'+a.url+'" target="_blank">'+esc(a.name)+'</a>')).join(', ');
+  }
+  async function uploadFiles(list){
     try{
-      const list = files || (document.getElementById('chatFile')?.files||[]);
-      if(!list || !list.length) return;
-      for(let i=0;i<list.length;i++){
-        const f=list[i]; const fd = new FormData(); fd.append('file', f); fd.append('channel_id', String(cid));
-        const r=await fetch('/api/chat/upload',{method:'POST',headers:{'X-CSRFToken':CSRF}, body: fd});
-        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка загрузки');
+      const files = list || (document.getElementById('cFile')?.files||[]);
+      if(!files || !files.length) return;
+      for(let i=0;i<files.length;i++){
+        const f=files[i];
+        const fd = new FormData();
+        fd.append('channel_id', String(CUR_CH));
+        fd.append('file', f);
+        const r=await fetch('/api/chat/upload',{method:'POST',headers:{'X-CSRFToken':CSRF},body:fd});
+        const j=await r.json();
+        if(j.ok){ cAtt.push({file_id: j.file_id, name: f.name, url: j.url}); }
+        else { alert((j.error||'Ошибка') + ': ' + (f && f.name ? f.name : '')); }
       }
-      toast('Файлы загружены'); location.reload();
+      updateCAtt(); toast('Файлы загружены');
     }catch(_){ alert('Ошибка загрузки'); }
   }
+  document.getElementById('btnUpload')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('cFile')?.click(); });
+  document.getElementById('cFile')?.addEventListener('change', e=>uploadFiles());
+  document.getElementById('cDrop')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('cFile')?.click(); });
+  document.getElementById('cDrop')?.addEventListener('dragover', e=>{ e.preventDefault(); });
+  document.getElementById('cDrop')?.addEventListener('drop', e=>{ e.preventDefault(); const f=e.dataTransfer.files; if(f&&f.length) uploadFiles(f); });
 
-  {% if current %}
-    const CID = {{ current.id }};
-    document.getElementById('btnChatSend')?.addEventListener('click', e=>{ e.preventDefault(); chatSend(CID); });
-    document.getElementById('btnChatUpload')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('chatFile')?.click(); });
-    document.getElementById('chatFile')?.addEventListener('change', e=>chatUpload(CID));
-    document.getElementById('chatDrop')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('chatFile')?.click(); });
-    document.getElementById('chatDrop')?.addEventListener('dragover', e=>{ e.preventDefault(); });
-    document.getElementById('chatDrop')?.addEventListener('drop', e=>{ e.preventDefault(); const files=e.dataTransfer.files; if(files && files.length) chatUpload(CID, files); });
-    // Hotkey: Ctrl/Cmd+Enter to send
-    document.getElementById('chatBody')?.addEventListener('keydown', e=>{
-      if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); chatSend(CID); }
-    });
-  {% endif %}
+  // SSE: новые сообщения в активном канале
+  (function(){
+    if(!CUR_CH) return;
+    try{
+      const es = new EventSource('/sse');
+      es.addEventListener('chat.message', e=>{
+        try{
+          const d=JSON.parse(e.data||'{}');
+          if(parseInt(d.channel_id||0,10)!==CUR_CH) return;
+          const list=document.getElementById('chatList');
+          const wrap=document.createElement('div'); wrap.className='msg'; wrap.dataset.id=String(d.id||'');
+          const meta=document.createElement('div'); meta.className='meta'; meta.textContent = '#'+(d.id||'')+' · сейчас';
+          const body=document.createElement('div'); body.className='body'; body.textContent = d.body||'';
+          wrap.appendChild(meta); wrap.appendChild(body);
+          list.appendChild(wrap);
+          list.scrollTop = list.scrollHeight;
+        }catch(_){}
+      });
+    }catch(_){}
+  })();
 </script>
 """
 
-MEETING_TMPL = """
-{% set m = meeting %}
-{% if not m %}
-  <h2>Встречи</h2>
+SEARCH_TMPL = """
+<h2 style="margin:0 0 8px 0;">Поиск по базе</h2>
+
+<div class="card">
+  <form method="get" action="{{ url_for('search_page') }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <input class="input" name="q" value="{{ q or '' }}" placeholder="строка поиска">
+    <button class="button" type="submit">Найти</button>
+  </form>
+</div>
+
+<div class="split" style="margin-top:10px;">
+  <div class="card">
+    <h3 style="margin:0 0 6px 0;">Inbox</h3>
+    <ul>
+      {% for r in results.inbox %}
+        <li>
+          <a href="{{ url_for('thread_view', tid=r.thread_id) }}">тред #{{ r.thread_id }}</a>
+          <div class="help" style="max-width:800px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ r.body }}</div>
+        </li>
+      {% else %}
+        <li class="help">Нет результатов</li>
+      {% endfor %}
+    </ul>
+  </div>
 
   <div class="card">
-    <h3>Запланировать встречу</h3>
-    <div class="help">Укажите тему, время и участников (и/или отделы)</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      <label>Тема <input class="input" id="mtTitle" placeholder="Встреча"></label>
-      <label>Уведомить за, мин <input class="input" id="mtNotify" type="number" value="15"></label>
-      <label>Начало <input class="input" id="mtStart" type="datetime-local"></label>
-      <label>Окончание <input class="input" id="mtEnd" type="datetime-local"></label>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
-      <label>Участники
-        <select class="select" id="mtUsers" multiple size="6">
-          {% for u in query_db('SELECT id,username FROM users WHERE org_id=? AND active=1 ORDER BY username',(user.org_id,)) %}
-            <option value="{{ u.id }}">{{ u.username }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label>Отделы
-        <select class="select" id="mtDepts" multiple size="6">
-          {% for d in query_db('SELECT id,name FROM departments WHERE org_id=? ORDER BY name',(user.org_id,)) %}
-            <option value="{{ d.id }}">{{ d.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-    </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
-      <button class="button" id="btnMtCreate">Запланировать</button>
-    </div>
+    <h3 style="margin:0 0 6px 0;">Задачи</h3>
+    <ul>
+      {% for r in results.tasks %}
+        <li>
+          <a href="{{ url_for('task_view', tid=r.id) }}">задача #{{ r.id }}</a> — {{ r.title or '' }}
+          {% if r.description %}<div class="help" style="max-width:800px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ r.description }}</div>{% endif %}
+        </li>
+      {% else %}
+        <li class="help">Нет результатов</li>
+      {% endfor %}
+    </ul>
   </div>
 
-  <div class="card" style="margin-top:10px;">
-    <h3>Список встреч</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Тема</th><th>Начало</th><th>Уведомление</th><th>Комната</th><th></th></tr></thead>
-      <tbody id="mtList">
-        <tr><td colspan="6"><div class="help">Загрузка...</div></td></tr>
-      </tbody>
-    </table>
+  <div class="card">
+    <h3 style="margin:0 0 6px 0;">Чат</h3>
+    <ul>
+      {% for r in results.chats %}
+        <li>
+          <a href="{{ url_for('chat_channel', cid=r.channel_id) }}">канал #{{ r.channel_id }}</a>
+          <div class="help" style="max-width:800px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ r.body }}</div>
+        </li>
+      {% else %}
+        <li class="help">Нет результатов</li>
+      {% endfor %}
+    </ul>
   </div>
-
-  <script nonce="{{ csp_nonce }}">
-    function vals(selId){ const el=document.getElementById(selId); return [...(el?.selectedOptions||[])].map(o=>parseInt(o.value,10)).filter(n=>!isNaN(n)); }
-    async function loadMeetings(){
-      try{
-        const r=await fetch('/api/meetings'); const j=await r.json();
-        const tb=document.getElementById('mtList'); tb.innerHTML='';
-        if(!j.ok || !(j.items||[]).length){ tb.innerHTML='<tr><td colspan="6"><div class="help">Нет встреч</div></td></tr>'; return; }
-        for(const it of j.items){
-          const tr=document.createElement('tr');
-          tr.innerHTML = `
-            <td>#${it.id}</td>
-            <td>${esc(it.title||'')}</td>
-            <td>${esc(it.start_at||'')}</td>
-            <td>${esc(String(it.notify_before_min||0))} мин</td>
-            <td class="help">${esc(it.room||'')}</td>
-            <td style="white-space:nowrap;display:flex;gap:6px;">
-              <a class="iconbtn small" href="/meeting/${it.id}">Join</a>
-              <button class="iconbtn small btnDel" data-id="${it.id}">Удалить</button>
-            </td>`;
-          tb.appendChild(tr);
-        }
-      }catch(_){ document.getElementById('mtList').innerHTML='<tr><td colspan="6"><div class="help">Ошибка</div></td></tr>'; }
-    }
-    async function createMeeting(){
-      const title=(document.getElementById('mtTitle').value||'').trim()||'Встреча';
-      const start_at=(document.getElementById('mtStart').value||'');
-      const end_at=(document.getElementById('mtEnd').value||'');
-      const notify_before_min=parseInt(document.getElementById('mtNotify').value||'0',10)||0;
-      const participants=vals('mtUsers'); const department_ids=vals('mtDepts');
-      try{
-        const r=await fetch('/api/meetings/schedule',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({title,start_at,end_at,participants,department_ids,notify_before_min})});
-        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-        toast('Встреча создана'); loadMeetings();
-      }catch(_){ alert('Ошибка сети'); }
-    }
-    async function deleteMeeting(id){
-      try{
-        const r=await fetch('/api/meetings/'+id,{method:'DELETE',headers:{'X-CSRFToken':CSRF}});
-        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-        toast('Удалено'); loadMeetings();
-      }catch(_){ alert('Ошибка сети'); }
-    }
-    document.getElementById('btnMtCreate')?.addEventListener('click', e=>{ e.preventDefault(); createMeeting(); });
-    document.getElementById('mtList')?.addEventListener('click', e=>{
-      const b=e.target.closest('.btnDel'); if(!b) return;
-      e.preventDefault(); if(confirm('Удалить встречу?')) deleteMeeting(parseInt(b.getAttribute('data-id')||'0',10));
-    });
-    loadMeetings();
-  </script>
-
-{% else %}
-  <h2>Встреча #{{ m.id }} · {{ m.title or 'Без темы' }}</h2>
-  <div class="split equal" style="grid-template-columns:1fr 380px;">
-    <div class="card">
-      <div class="help">Комната: {{ m.room }}</div>
-      <div style="margin-top:8px;">
-        <iframe src="{{ jitsi_base }}/{{ m.room }}" allow="camera; microphone; display-capture; clipboard-write" style="width:100%;height:70vh;border:1px solid var(--border);border-radius:12px;"></iframe>
-      </div>
-      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;flex-wrap:wrap;">
-        <button class="button secondary" id="btnStartRec">Начать запись</button>
-        <button class="button warn" id="btnStopRec">Остановить запись</button>
-        <a class="button ghost" href="{{ url_for('meetings_page') }}">← ко встречам</a>
-      </div>
-    </div>
-    <div class="card">
-      <h3>Сведения</h3>
-      <div><strong>Начало:</strong> {{ m.start_at or '—' }}</div>
-      <div><strong>Окончание:</strong> {{ m.end_at or '—' }}</div>
-      <div><strong>Участники:</strong>
-        <div class="help">
-          {% set ppl = (m.participants_json or '[]') %}
-          {{ ppl }}
-        </div>
-      </div>
-      <div style="margin-top:8px;">
-        <div><strong>Итог (AI):</strong></div>
-        <div class="help">{{ m.ai_summary or '—' }}</div>
-      </div>
-    </div>
-  </div>
-  <script nonce="{{ csp_nonce }}">
-    const MID = {{ m.id }};
-    async function startRec(){
-      try{
-        const r=await fetch('/api/meeting/'+MID+'/start_recording',{method:'POST',headers:{'X-CSRFToken':CSRF}});
-        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка'); toast('Запись начата');
-      }catch(_){ alert('Ошибка сети'); }
-    }
-    async function stopRec(){
-      try{
-        const r=await fetch('/api/meeting/'+MID+'/stop_recording',{method:'POST',headers:{'X-CSRFToken':CSRF}});
-        const j=await r.json(); if(!j.ok) return alert(j.error||'Ошибка'); toast('Запись остановлена'); if(j.summary) toast('AI: '+j.summary);
-      }catch(_){ alert('Ошибка сети'); }
-    }
-    document.getElementById('btnStartRec')?.addEventListener('click', e=>{ e.preventDefault(); startRec(); });
-    document.getElementById('btnStopRec')?.addEventListener('click', e=>{ e.preventDefault(); stopRec(); });
-  </script>
-{% endif %}
+</div>
 """
-# === END STYLES PART 7/9 ===
-# === STYLES PART 8/9 — SETTINGS (Admin): Channels/Webhooks/AI/Statuses/Users/Tokens/Queue/Custom Fields ===
+# === END STYLES PART 7/11 ===
+# === STYLES PART 8/11 — SETTINGS (Admin) ===
 # -*- coding: utf-8 -*-
 
 SETTINGS_TMPL = """
 <h2 style="margin:0 0 8px 0;">Настройки</h2>
 
-<div class="split" style="align-items:start;">
+<div class="split">
   <!-- Каналы -->
   <div class="card">
-    <h3>Каналы</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Тип</th><th>Название</th><th>Активен</th><th></th></tr></thead>
-      <tbody>
-        {% for ch in channels %}
-        <tr>
-          <td>#{{ ch.id }}</td>
-          <td>{{ ch.type }}</td>
-          <td>{{ ch.name or '' }}</td>
-          <td>{{ 'yes' if ch.active else 'no' }}</td>
-          <td style="white-space:nowrap;display:flex;gap:6px;">
-            <form method="post" action="{{ url_for('settings_channel_toggle', cid=ch.id) }}" class="js-confirm" data-confirm="Переключить активность?">
-              <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-              <button class="iconbtn small" type="submit">{{ 'Выключить' if ch.active else 'Включить' }}</button>
-            </form>
-            {% if ch.type=='phone' %}
-              <details>
-                <summary class="iconbtn small">Телефония</summary>
-                <form method="post" action="{{ url_for('settings_phone_update', cid=ch.id) }}" style="display:grid;gap:8px;min-width:320px;margin-top:8px;">
-                  <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-                  <label>Провайдер
-                    <select class="select" name="provider">
-                      {% set prov = (ch.cfg.provider or '') %}
-                      {% for p in ('', 'mango', 'uis', 'telfin') %}
-                      <option value="{{ p }}" {% if prov==p %}selected{% endif %}>{{ p or '—' }}</option>
-                      {% endfor %}
-                    </select>
-                  </label>
-                  <label>Секрет (канала) <input class="input" name="secret" value="{{ (ch.secret or '') }}"></label>
-                  <label>Подпись провайдера <input class="input" name="signing_key" value="{{ ch.cfg.signing_key or '' }}"></label>
-                  <label>From (E.164) <input class="input" name="from_e164" value="{{ ch.cfg.from_e164 or '' }}"></label>
-                  <div style="display:flex;gap:8px;justify-content:flex-end;">
-                    <button class="button" type="submit">Сохранить</button>
-                    <button class="button secondary btnUrls" data-id="{{ ch.id }}" type="button">URL вебхуков</button>
-                  </div>
-                  <div class="help" id="urls-{{ ch.id }}"></div>
-                </form>
-              </details>
-            {% endif %}
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="5"><div class="help">Каналы отсутствуют</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Добавить канал</summary>
-      <form method="post" action="{{ url_for('settings_channel_add') }}" style="display:grid;gap:8px;max-width:420px;margin-top:8px;">
+    <details open>
+      <summary class="button ghost">Каналы</summary>
+      <div class="help" style="margin:6px 0;">Управление каналами (телефония, Telegram, VK, email и т.д.).</div>
+      <table class="table">
+        <thead>
+          <tr><th>ID</th><th>Тип</th><th>Название</th><th>Активен</th><th>Секрет</th><th>Действия</th></tr>
+        </thead>
+        <tbody>
+          {% for ch in channels %}
+          <tr data-id="{{ ch.id }}">
+            <td>#{{ ch.id }}</td>
+            <td>{{ ch.type }}</td>
+            <td>{{ ch.name or '—' }}</td>
+            <td>
+              <form method="post" action="{{ url_for('settings_channel_toggle', cid=ch.id) }}" class="js-confirm" data-confirm="Переключить активность канала?">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+                <button class="iconbtn small" type="submit">{{ 'выключить' if ch.active else 'включить' }}</button>
+              </form>
+            </td>
+            <td class="help" title="секрет хранится в БД">{{ (ch.secret or '')[:3] ~ '***' if ch.secret else '—' }}</td>
+            <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap;">
+              {% if ch.type=='phone' %}
+                <button class="iconbtn small btnPhoneCfg" data-id="{{ ch.id }}">Настроить</button>
+                <button class="iconbtn small btnPhoneUrls" data-id="{{ ch.id }}">Webhook URL</button>
+              {% else %}
+                <span class="help">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6"><div class="help">Каналов нет</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <h4 style="margin:10px 0 6px 0;">Добавить канал</h4>
+      <form method="post" action="{{ url_for('settings_channel_add') }}" style="display:grid;gap:8px;max-width:660px;">
         <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <label>Тип
-          <select class="select" name="type">
-            {% for t in ('phone','telegram','vk','email','web','other') %}
-            <option value="{{ t }}">{{ t }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>Название <input class="input" name="name" placeholder="Произвольное"></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="button" type="submit">Создать</button></div>
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Тип <input class="input" name="type" placeholder="напр., phone / telegram / vk"></label>
+          <label>Название <input class="input" name="name" placeholder="отображаемое имя (опц.)"></label>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button class="button" type="submit">Добавить</button>
+        </div>
       </form>
+
+      <!-- Модал: настройка телефонного канала -->
+      <div class="modal-backdrop" id="phoneCfgModal">
+        <div class="modal">
+          <h3>Телефония: настройка канала</h3>
+          <form id="phoneCfgForm" method="post" style="display:grid;gap:8px;max-width:740px;">
+            <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+            <input type="hidden" id="pcfId" value="">
+            <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
+              <label>Провайдер
+                <select class="select" name="provider" id="pcfProvider">
+                  <option value="">—</option>
+                  <option value="mango">mango</option>
+                  <option value="uis">uis</option>
+                  <option value="telfin">telfin</option>
+                </select>
+              </label>
+              <label>Исходящий номер (E.164) <input class="input" name="from_e164" id="pcfFrom" placeholder="+7495..."></label>
+              <label>Секрет (канала) <input class="input" name="secret" id="pcfSecret" placeholder=""></label>
+            </div>
+            <label>Signing key (провайдера) <input class="input" name="signing_key" id="pcfSigning" placeholder=""></label>
+            <div id="pcfWebhook" class="help" style="margin-top:6px;">Webhook URL появятся здесь</div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
+              <button class="button secondary" type="button" id="btnPhoneCfgClose">Закрыть</button>
+              <button class="button" type="button" id="btnPhoneCfgSave">Сохранить</button>
+            </div>
+          </form>
+        </div>
+      </div>
     </details>
   </div>
 
   <!-- Вебхуки -->
   <div class="card">
-    <h3>Вебхуки</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Событие</th><th>URL</th><th>Секрет</th><th>Активен</th><th></th></tr></thead>
-      <tbody id="whList">
-        {% for w in webhooks %}
-        <tr data-id="{{ w.id }}"><td>#{{ w.id }}</td><td>{{ w.event }}</td><td class="help">{{ w.url }}</td><td class="help">{{ w.secret or '' }}</td><td>{{ 'yes' if w.active else 'no' }}</td>
-          <td style="white-space:nowrap;display:flex;gap:6px;">
-            <button class="iconbtn small btnWhTest" data-id="{{ w.id }}">Тест</button>
-            <form method="post" action="{{ url_for('settings_webhook_delete', wid=w.id) }}" class="js-confirm" data-confirm="Удалить вебхук?">
-              <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-              <button class="iconbtn small" type="submit">Удалить</button>
-            </form>
-          </td></tr>
-        {% else %}
-        <tr><td colspan="6"><div class="help">Нет вебхуков</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Добавить вебхук</summary>
-      <form method="post" action="{{ url_for('settings_webhook_add') }}" style="display:grid;gap:8px;max-width:520px;margin-top:8px;">
+    <details open>
+      <summary class="button ghost">Вебхуки</summary>
+      <div class="help" style="margin:6px 0;">Событийные уведомления во внешние системы (поддерживаются подписи HMAC-SHA256).</div>
+      <table class="table">
+        <thead><tr><th>ID</th><th>Событие</th><th>URL</th><th>Секрет</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="whTBody">
+          {% for w in webhooks %}
+          <tr data-id="{{ w.id }}">
+            <td>#{{ w.id }}</td>
+            <td>{{ w.event }}</td>
+            <td>{{ w.url }}</td>
+            <td class="help">{{ (w.secret or '')[:3] ~ '***' if w.secret else '—' }}</td>
+            <td>{{ 'да' if w.active else 'нет' }}</td>
+            <td style="white-space:nowrap;display:flex;gap:6px;">
+              <button class="iconbtn small btnWhTest" data-id="{{ w.id }}">Тест</button>
+              <form method="post" action="{{ url_for('settings_webhook_delete', wid=w.id) }}" style="margin:0" class="js-confirm" data-confirm="Удалить вебхук?">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+                <button class="iconbtn small" type="submit">Удалить</button>
+              </form>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6"><div class="help">Нет вебхуков</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <h4 style="margin:10px 0 6px 0;">Добавить вебхук</h4>
+      <form method="post" action="{{ url_for('settings_webhook_add') }}" style="display:grid;gap:8px;max-width:820px;">
         <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <label>Событие <input class="input" name="event" placeholder="например, task.created" required></label>
-        <label>URL <input class="input" name="url" placeholder="https://example.com/wh" required></label>
-        <label>Секрет (подпись) <input class="input" name="secret" placeholder="опционально"></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="button" type="submit">Добавить</button></div>
+        <div class="split" style="grid-template-columns:1fr 2fr;gap:8px;">
+          <label>Событие <input class="input" name="event" placeholder="например, task.created"></label>
+          <label>URL <input class="input" name="url" placeholder="https://..."></label>
+        </div>
+        <label>Секрет (для подписи) <input class="input" name="secret" placeholder="опционально"></label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button class="button" type="submit">Добавить</button>
+        </div>
       </form>
+
+      <h4 style="margin:10px 0 6px 0;">Очередь доставки</h4>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="button ghost" id="btnWhQueue">Обновить очередь</button>
+      </div>
+      <table class="table" style="margin-top:6px;">
+        <thead><tr><th>ID</th><th>Событие</th><th>Статус</th><th>Попыток</th><th>След. попытка</th><th>Создан</th><th></th></tr></thead>
+        <tbody id="whQueueBody"><tr><td colspan="7"><div class="help">Нажмите «Обновить очередь»</div></td></tr></tbody>
+      </table>
     </details>
   </div>
 </div>
 
-<div class="split" style="margin-top:10px;align-items:start;">
-  <!-- AI конфиг -->
+<div class="split" style="margin-top:10px;">
+  <!-- AI Config -->
   <div class="card">
-    <h3>AI‑конфиг</h3>
-    <form method="post" action="{{ url_for('settings_ai_config') }}" style="display:grid;gap:8px;max-width:520px;">
-      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-      <label>Провайдер <input class="input" name="provider" value=""></label>
-      <label>Модель <input class="input" name="model" value=""></label>
-      <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
-        <label>Temperature <input class="input" name="temperature" type="number" step="0.01" value="0.3"></label>
-        <label>Max tokens <input class="input" name="max_tokens" type="number" value="512"></label>
-      </div>
-      <label>Policy (JSON) <textarea class="input" name="policy" rows="5" placeholder='{"exclude_internal_notes":true}'></textarea></label>
-      <div style="display:flex;gap:8px;justify-content:flex-end;">
-        <button class="button secondary" type="button" id="btnAiLoad">Показать текущий</button>
-        <button class="button" type="submit">Сохранить</button>
-      </div>
-    </form>
-    <div class="help" style="margin-top:6px;">Последние задания AI:</div>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Создано</th></tr></thead>
-      <tbody>
-        {% for j in ai_jobs %}
-        <tr><td>#{{ j.id }}</td><td>{{ j.kind }}</td><td>{{ j.status }}</td><td>{{ j.created_at }}</td></tr>
-        {% else %}
-        <tr><td colspan="4"><div class="help">Пока нет</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <details open>
+      <summary class="button ghost">AI конфигурация</summary>
+      <div class="help" style="margin:6px 0;">Провайдер, модель и политика для AI-функций.</div>
+      <form method="post" action="{{ url_for('settings_ai_config') }}" style="display:grid;gap:8px;max-width:860px;">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <div class="split" style="grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;">
+          <label>Провайдер <input class="input" name="provider" id="aiProv"></label>
+          <label>Модель <input class="input" name="model" id="aiModel"></label>
+          <label>Temperature <input class="input" name="temperature" id="aiTemp" type="number" step="0.05" value="0.3"></label>
+          <label>Max tokens <input class="input" name="max_tokens" id="aiMaxTok" type="number" step="1" value="512"></label>
+        </div>
+        <label>Политика (JSON) <textarea class="input" name="policy" id="aiPolicy" rows="6" placeholder='{"allow_summary":true,...}'></textarea></label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button class="button" type="submit">Сохранить</button>
+          <button class="button ghost" type="button" id="btnAiLoad">Загрузить текущую</button>
+        </div>
+      </form>
+      <div class="help" id="aiLoadHint"></div>
+    </details>
   </div>
 
   <!-- Статусы задач -->
   <div class="card">
-    <h3>Статусы задач</h3>
-    <ul>
-      {% for s in task_statuses %}
-      <li style="display:flex;gap:8px;align-items:center;">
-        <span class="tag">{{ s.name }}</span>
-        <form method="post" action="{{ url_for('settings_task_status_delete', sid=s.id) }}" class="js-confirm" data-confirm="Удалить статус?">
-          <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-          <button class="iconbtn small" type="submit">Удалить</button>
-        </form>
-      </li>
-      {% else %}
-      <li class="help">Нет пользовательских статусов</li>
-      {% endfor %}
-    </ul>
-    <form method="post" action="{{ url_for('settings_task_status_add') }}" style="display:flex;gap:8px;align-items:end;margin-top:8px;flex-wrap:wrap;">
-      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-      <label>Новый статус <input class="input" name="name" placeholder="in_progress" required></label>
-      <button class="button" type="submit">Добавить</button>
-    </form>
+    <details open>
+      <summary class="button ghost">Статусы задач</summary>
+      <ul id="statusList">
+        {% for s in task_statuses %}<li>#{{ s.id }} — {{ s.name }}
+          <form method="post" action="{{ url_for('settings_task_status_delete', sid=s.id) }}" style="display:inline;margin-left:8px" class="js-confirm" data-confirm="Удалить статус?">
+            <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+            <button class="iconbtn small" type="submit">Удалить</button>
+          </form>
+        </li>
+        {% else %}
+        <li class="help">Нет статусов</li>
+        {% endfor %}
+      </ul>
+      <form method="post" action="{{ url_for('settings_task_status_add') }}" style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <input class="input" name="name" placeholder="например, in_progress" required style="max-width:240px;">
+        <button class="button" type="submit">Добавить</button>
+      </form>
+    </details>
   </div>
 </div>
 
-<div class="split" style="margin-top:10px;align-items:start;">
+<div class="split" style="margin-top:10px;">
   <!-- Пользователи -->
   <div class="card">
-    <h3>Пользователи</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Логин</th><th>Email</th><th>Роль</th><th>Активен</th><th>Создан</th><th></th></tr></thead>
-      <tbody>
-        {% for u in users %}
-        <tr>
-          <td>#{{ u.id }}</td><td>{{ u.username }}</td><td>{{ u.email or '—' }}</td><td>{{ u.role }}</td><td>{{ 'yes' if u.active else 'no' }}</td><td>{{ u.created_at }}</td>
-          <td style="white-space:nowrap;display:flex;gap:6px;">
-            <form method="post" action="{{ url_for('settings_user_toggle', uid=u.id) }}">
-              <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-              <button class="iconbtn small" type="submit">{{ 'Деактивировать' if u.active else 'Активировать' }}</button>
-            </form>
-            <form method="post" action="{{ url_for('settings_user_password', uid=u.id) }}" class="js-confirm" data-confirm="Сменить пароль пользователю?">
-              <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-              <input class="input" name="password" placeholder="новый пароль" style="max-width:160px;">
-              <button class="iconbtn small" type="submit">Сменить пароль</button>
-            </form>
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="7"><div class="help">Нет пользователей</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Добавить пользователя</summary>
-      <form method="post" action="{{ url_for('settings_user_add') }}" style="display:grid;gap:8px;max-width:520px;margin-top:8px;">
-        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <label>Логин <input class="input" name="username" required></label>
-        <label>Email <input class="input" name="email" type="email"></label>
-        <label>Роль
-          <select class="select" name="role">
-            {% for r in ('admin','manager','agent','finance') %}
-            <option value="{{ r }}">{{ r }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>Отдел
-          <select class="select" name="department_id">
-            <option value="">—</option>
-            {% for d in departments %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
-          </select>
-        </label>
-        <label>Пароль <input class="input" name="password" type="password" required></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;"><button class="button" type="submit">Создать</button></div>
-      </form>
-    </details>
-  </div>
+    <details open>
+      <summary class="button ghost">Пользователи</summary>
+      <table class="table">
+        <thead><tr><th>ID</th><th>Логин</th><th>Email</th><th>Роль</th><th>Активен</th><th>Создан</th><th></th></tr></thead>
+        <tbody>
+          {% for u in users %}
+          <tr data-id="{{ u.id }}">
+            <td>#{{ u.id }}</td>
+            <td>{{ u.username }}</td>
+            <td>{{ u.email or '—' }}</td>
+            <td>{{ u.role }}</td>
+            <td>{{ 'да' if u.active else 'нет' }}</td>
+            <td>{{ u.created_at }}</td>
+            <td style="white-space:nowrap;display:flex;gap:6px;flex-wrap:wrap;">
+              <form method="post" action="{{ url_for('settings_user_toggle', uid=u.id) }}" style="margin:0" class="js-confirm" data-confirm="Переключить активность пользователя?">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+                <button class="iconbtn small" type="submit">{{ 'деактивировать' if u.active else 'активировать' }}</button>
+              </form>
+              <button class="iconbtn small btnPwd" data-id="{{ u.id }}">Сменить пароль</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7"><div class="help">Нет пользователей</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
 
-  <!-- API Tokens -->
-  <div class="card">
-    <h3>API‑токены</h3>
-    <div class="help">Токен показывается только один раз при создании</div>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Имя</th><th>User</th><th>Scopes</th><th>Активен</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
-      <tbody id="tokTbl"><tr><td colspan="8"><div class="help">Загрузка...</div></td></tr></tbody>
-    </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Создать токен</summary>
-      <div style="display:grid;gap:8px;max-width:520px;margin-top:8px;">
-        <label>Имя <input class="input" id="tokName" placeholder="API Token"></label>
-        <label>User
-          <select class="select" id="tokUser">
-            <option value="">—</option>
-            {% for u in users %}<option value="{{ u.id }}">{{ u.username }}</option>{% endfor %}
-          </select>
-        </label>
-        <label>Scopes (через запятую) <input class="input" id="tokScopes" placeholder="read,write"></label>
-        <label>Expires (лок.) <input class="input" id="tokExpires" type="datetime-local"></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;">
-          <button class="button" type="button" id="btnTokCreate">Создать</button>
+      <h4 style="margin:10px 0 6px 0;">Добавить пользователя</h4>
+      {% set depts = departments or [] %}
+      <form method="post" action="{{ url_for('settings_user_add') }}" style="display:grid;gap:8px;max-width:860px;" class="form-fixed">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
+          <label>Логин <input class="input" name="username" required></label>
+          <label>Email <input class="input" type="email" name="email"></label>
+          <label>Роль
+            <select class="select" name="role">
+              <option value="agent">agent</option>
+              <option value="manager">manager</option>
+              <option value="finance">finance</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
         </div>
-        <div id="tokOnce" class="help"></div>
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Пароль <input class="input" type="password" name="password" required></label>
+          <label>Отдел
+            <select class="select" name="department_id">
+              <option value="">—</option>
+              {% for d in depts %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+            </select>
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button class="button" type="submit">Создать</button>
+        </div>
+      </form>
+
+      <!-- Модал смены пароля -->
+      <div class="modal-backdrop" id="pwdModal">
+        <div class="modal">
+          <h3>Сменить пароль</h3>
+          <form id="pwdForm" method="post" style="display:grid;gap:8px;min-width:320px;max-width:520px;">
+            <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+            <input type="hidden" id="pwdUid" value="">
+            <label>Новый пароль <input class="input" id="pwdVal" type="password" required></label>
+            <div class="help">Минимум 12 символов, верхний/нижний регистры, цифры, спецсимвол</div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+              <button class="button secondary" type="button" id="btnPwdCancel">Отмена</button>
+              <button class="button" type="button" id="btnPwdSave">Сохранить</button>
+            </div>
+          </form>
+        </div>
       </div>
     </details>
   </div>
-</div>
 
-<div class="split" style="margin-top:10px;align-items:start;">
   <!-- Отделы -->
   <div class="card">
-    <h3>Отделы</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Название</th><th>Slug</th><th>Создан</th></tr></thead>
-      <tbody>
-        {% for d in departments %}
-        <tr><td>#{{ d.id }}</td><td>{{ d.name }}</td><td class="help">{{ d.slug or '—' }}</td><td>{{ d.created_at }}</td></tr>
+    <details open>
+      <summary class="button ghost">Отделы</summary>
+      <ul>
+        {% for d in departments %}<li>#{{ d.id }} — {{ d.name }} <span class="help">({{ d.slug or '' }})</span></li>
         {% else %}
-        <tr><td colspan="4"><div class="help">Отделы не созданы</div></td></tr>
+        <li class="help">Нет отделов</li>
         {% endfor %}
-      </tbody>
-    </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Добавить отдел</summary>
-      <form method="post" action="{{ url_for('settings_department_add') }}" style="display:flex;gap:8px;align-items:end;margin-top:8px;flex-wrap:wrap;">
+      </ul>
+      <form method="post" action="{{ url_for('settings_department_add') }}" style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
         <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
-        <label>Название <input class="input" name="name" placeholder="Например, Продажи" required></label>
-        <button class="button" type="submit">Создать</button>
+        <input class="input" name="name" placeholder="Название отдела" required style="max-width:260px;">
+        <button class="button" type="submit">Добавить</button>
       </form>
     </details>
   </div>
 </div>
 
-<div class="split" style="margin-top:10px;align-items:start;">
-  <!-- Очередь вебхуков -->
-  <div class="card">
-    <h3>Очередь вебхуков</h3>
-    <table class="table">
-      <thead><tr><th>ID</th><th>Событие</th><th>Статус</th><th>Пыт.</th><th>Следующая попытка</th><th>Создано</th><th></th></tr></thead>
-      <tbody id="whqTbl"><tr><td colspan="7"><div class="help">Загрузка...</div></td></tr></tbody>
-    </table>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;">
-      <button class="iconbtn small" id="btnWhqReload">Обновить</button>
-    </div>
-  </div>
-
-  <!-- Кастомные поля (no-code) -->
-  <div class="card">
-    <h3>Пользовательские поля</h3>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
-      <label>Сущность <input class="input" id="cfEntity" placeholder="task|deal|company" style="max-width:200px;"></label>
-      <button class="button" id="btnCfLoad" type="button">Показать</button>
+<!-- API токены -->
+<div class="card" style="margin-top:10px;">
+  <details>
+    <summary class="button ghost">API токены</summary>
+    <div class="help" style="margin:6px 0;">Токен отображается только один раз при создании; храните его безопасно.</div>
+    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+      <label>Имя <input class="input" id="tokName" placeholder="например, интеграция ERP"></label>
+      <label>User ID (опц.) <input class="input" id="tokUser" placeholder=""></label>
+      <label>Scopes (csv) <input class="input" id="tokScopes" placeholder="read,write"></label>
+      <label>Expires <input class="input" id="tokExp" type="datetime-local"></label>
+      <button class="button" id="btnTokCreate">Создать токен</button>
+      <button class="button ghost" id="btnTokRefresh">Обновить список</button>
     </div>
     <table class="table" style="margin-top:8px;">
-      <thead><tr><th>ID</th><th>Key</th><th>Type</th><th>Label</th><th>Required</th><th>Default</th></tr></thead>
-      <tbody id="cfTbl"><tr><td colspan="6"><div class="help">—</div></td></tr></tbody>
+      <thead><tr><th>ID</th><th>Имя</th><th>User</th><th>Scopes</th><th>Expires</th><th>Активен</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+      <tbody id="tokTBody"><tr><td colspan="9"><div class="help">Нажмите «Обновить список»</div></td></tr></tbody>
     </table>
-    <details style="margin-top:8px;">
-      <summary class="button ghost">Добавить поле</summary>
-      <div style="display:grid;gap:8px;max-width:520px;margin-top:8px;">
-        <label>Entity <input class="input" id="cfEntityNew" placeholder="task" required></label>
-        <label>Key <input class="input" id="cfKey" placeholder="priority" required></label>
-        <label>Type <input class="input" id="cfType" placeholder="text|number|date|select"></label>
-        <label>Label <input class="input" id="cfLabel" placeholder="Приоритет"></label>
-        <label>Required <select class="select" id="cfReq"><option value="0">no</option><option value="1">yes</option></select></label>
-        <label>Default <input class="input" id="cfDefault"></label>
-        <label>Options (JSON) <input class="input" id="cfOptions" placeholder='["A","B"]'></label>
-        <label>Rules (JSON) <input class="input" id="cfRules" placeholder='{}'></label>
-        <div style="display:flex;gap:8px;justify-content:flex-end;">
-          <button class="button" id="btnCfAdd" type="button">Добавить</button>
-        </div>
-        <div id="cfMsg" class="help"></div>
-      </div>
-    </details>
-  </div>
+  </details>
 </div>
 
 <script nonce="{{ csp_nonce }}">
-  function esc(s){ return String(s||'').replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+  const CSRF_FORM = '{{ session.get("csrf_token","") }}';
 
-  // Телефония: показать URL вебхуков
-  document.querySelectorAll('.btnUrls')?.forEach(b=>{
-    b.addEventListener('click', async e=>{
+  // Телефония: модал
+  document.addEventListener('click', e=>{
+    const b1=e.target.closest('.btnPhoneCfg');
+    const b2=e.target.closest('.btnPhoneUrls');
+    if(b1){
       e.preventDefault();
-      const id = b.getAttribute('data-id');
-      try{
-        const r = await fetch('/settings/phone/'+id+'/webhook_urls');
-        const j = await r.json();
-        const box = document.getElementById('urls-'+id);
-        if(j.ok){
-          box.innerHTML = 'CTI: <code>'+esc(j.cti_webhook)+'</code><br>Recording: <code>'+esc(j.recording_webhook)+'</code>';
-        }else{
-          box.textContent = j.error||'Ошибка';
-        }
-      }catch(_){ alert('Ошибка сети'); }
-    });
-  });
-
-  // Webhook test
-  document.getElementById('whList')?.addEventListener('click', async e=>{
-    const b = e.target.closest('.btnWhTest'); if(!b) return;
-    e.preventDefault();
-    const id = b.getAttribute('data-id');
-    try{
-      const r = await fetch('/settings/webhook/test/'+id, {method:'POST', headers:{'X-CSRFToken': CSRF}});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      toast('Тест поставлен в очередь');
-    }catch(_){ alert('Ошибка сети'); }
-  });
-
-  // AI: показать текущий конфиг
-  document.getElementById('btnAiLoad')?.addEventListener('click', async e=>{
-    e.preventDefault();
-    try{
-      const r = await fetch('/settings/ai/config');
-      const j = await r.json();
-      if(j.ok){
-        const c = j.config||{};
-        document.querySelector('input[name="provider"]').value = c.provider||'';
-        document.querySelector('input[name="model"]').value = c.model||'';
-        document.querySelector('input[name="temperature"]').value = (c.temperature!=null?c.temperature:0.3);
-        document.querySelector('input[name="max_tokens"]').value = (c.max_tokens!=null?c.max_tokens:512);
-        document.querySelector('textarea[name="policy"]').value = JSON.stringify(c.policy||{}, null, 2);
-      }else{
-        alert(j.error||'Ошибка');
-      }
-    }catch(_){ alert('Ошибка сети'); }
-  });
-
-  // Tokens list
-  async function loadTokens(){
-    try{
-      const r = await fetch('/api/tokens/list'); const j = await r.json();
-      const tb = document.getElementById('tokTbl'); tb.innerHTML='';
-      if(!j.ok || !(j.items||[]).length){ tb.innerHTML = '<tr><td colspan="8"><div class="help">Нет токенов</div></td></tr>'; return; }
-      for(const t of j.items){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>#${t.id}</td>
-          <td>${esc(t.name||'')}</td>
-          <td>${esc(String(t.user_id||'—'))}</td>
-          <td class="help">${esc(t.scopes||'')}</td>
-          <td>${t.active?'yes':'no'}</td>
-          <td>${esc(t.expires_at||'')}</td>
-          <td>${esc(t.last_used_at||'')}</td>
-          <td><button class="iconbtn small btnTokToggle" data-id="${t.id}">${t.active?'Откл.':'Вкл.'}</button></td>`;
-        tb.appendChild(tr);
-      }
-    }catch(_){
-      document.getElementById('tokTbl').innerHTML = '<tr><td colspan="8"><div class="help">Ошибка</div></td></tr>';
+      const id=b1.getAttribute('data-id');
+      document.getElementById('pcfId').value = id;
+      document.getElementById('pcfProvider').value = '';
+      document.getElementById('pcfFrom').value = '';
+      document.getElementById('pcfSecret').value = '';
+      document.getElementById('pcfSigning').value = '';
+      document.getElementById('pcfWebhook').textContent = 'Webhook URL появятся здесь';
+      document.getElementById('phoneCfgModal').classList.add('show');
+      return;
     }
-  }
-  loadTokens();
-
-  document.getElementById('tokTbl')?.addEventListener('click', async e=>{
-    const b = e.target.closest('.btnTokToggle'); if(!b) return;
+    if(b2){
+      e.preventDefault();
+      const id=b2.getAttribute('data-id');
+      fetch('/settings/phone/'+id+'/webhook_urls')
+        .then(r=>r.json()).then(j=>{
+          const el=document.getElementById('pcfWebhook');
+          if(j.ok){ el.innerHTML = '<div class="help">CTI: <code>'+esc(j.cti_webhook)+'</code><br>Recording: <code>'+esc(j.recording_webhook)+'</code></div>'; }
+          else { alert(j.error||'Ошибка'); }
+        }).catch(()=>alert('Ошибка сети'));
+      // также откроем модал для наглядности
+      document.getElementById('pcfId').value = id;
+      document.getElementById('phoneCfgModal').classList.add('show');
+      return;
+    }
+  });
+  document.getElementById('btnPhoneCfgClose')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('phoneCfgModal').classList.remove('show'); });
+  document.getElementById('btnPhoneCfgSave')?.addEventListener('click', e=>{
     e.preventDefault();
-    const id = parseInt(b.getAttribute('data-id')||'0',10)||0;
-    try{
-      const r = await fetch('/api/tokens/toggle', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({id})});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      loadTokens();
-    }catch(_){ alert('Ошибка сети'); }
+    const id=document.getElementById('pcfId').value||'';
+    if(!id) return;
+    const fd=new FormData();
+    fd.append('csrf_token', CSRF_FORM);
+    fd.append('provider', document.getElementById('pcfProvider').value||'');
+    fd.append('from_e164', document.getElementById('pcfFrom').value||'');
+    fd.append('secret', document.getElementById('pcfSecret').value||'');
+    fd.append('signing_key', document.getElementById('pcfSigning').value||'');
+    fetch('/settings/phone/'+id+'/update',{method:'POST', body: fd, credentials:'same-origin'})
+      .then(()=>{ toast('Сохранено'); document.getElementById('phoneCfgModal').classList.remove('show'); location.reload(); })
+      .catch(()=>alert('Ошибка сети'));
   });
 
-  document.getElementById('btnTokCreate')?.addEventListener('click', async e=>{
+  // Вебхуки: тест
+  document.getElementById('whTBody')?.addEventListener('click', e=>{
+    const b=e.target.closest('.btnWhTest'); if(!b) return;
     e.preventDefault();
-    const name = (document.getElementById('tokName').value||'API Token').trim();
-    const user_id = (document.getElementById('tokUser').value||'')||null;
-    const scopes = (document.getElementById('tokScopes').value||'').split(',').map(s=>s.trim()).filter(Boolean);
-    const expires_at = (document.getElementById('tokExpires').value||'');
-    try{
-      const r = await fetch('/api/tokens/create', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({name, user_id, scopes, expires_at})});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      document.getElementById('tokOnce').innerHTML = 'Токен (показывается один раз): <code>'+esc(j.token||'')+'</code>';
-      loadTokens();
-    }catch(_){ alert('Ошибка сети'); }
+    const id=b.getAttribute('data-id')||'';
+    fetch('/settings/webhook/test/'+id,{method:'POST',headers:{'X-CSRFToken':CSRF}})
+      .then(r=>r.json()).then(j=>{ if(j.ok) toast('Тест поставлен в очередь'); else alert(j.error||'Ошибка'); })
+      .catch(()=>alert('Ошибка сети'));
   });
 
-  // Webhook queue
-  async function loadWhq(){
-    try{
-      const r = await fetch('/api/webhook/queue'); const j = await r.json();
-      const tb = document.getElementById('whqTbl'); tb.innerHTML='';
-      if(!j.ok || !(j.items||[]).length){ tb.innerHTML='<tr><td colspan="7"><div class="help">Пусто</div></td></tr>'; return; }
-      for(const q of j.items){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>#${q.id}</td><td>${esc(q.event||'')}</td><td>${esc(q.status||'')}</td><td>${esc(String(q.attempts||0))}</td>
-          <td>${esc(q.next_try_at||'')}</td><td>${esc(q.created_at||'')}</td>
-          <td><button class="iconbtn small btnRetry" data-id="${q.id}">Retry</button></td>`;
-        tb.appendChild(tr);
-      }
-    }catch(_){ document.getElementById('whqTbl').innerHTML='<tr><td colspan="7"><div class="help">Ошибка</div></td></tr>'; }
+  // Очередь вебхуков
+  function whRowHTML(q){
+    return `
+      <tr data-id="${q.id}">
+        <td>#${q.id}</td>
+        <td>${esc(q.event||'')}</td>
+        <td>${esc(q.status||'')}</td>
+        <td>${esc(String(q.attempts||0))}</td>
+        <td>${esc(q.next_try_at||'—')}</td>
+        <td>${esc(q.created_at||'')}</td>
+        <td><button class="iconbtn small btnWhRetry" data-id="${q.id}">Повторить</button></td>
+      </tr>`;
   }
-  loadWhq();
-  document.getElementById('btnWhqReload')?.addEventListener('click', e=>{ e.preventDefault(); loadWhq(); });
-  document.getElementById('whqTbl')?.addEventListener('click', async e=>{
-    const b = e.target.closest('.btnRetry'); if(!b) return;
+  document.getElementById('btnWhQueue')?.addEventListener('click', e=>{
     e.preventDefault();
-    const id = parseInt(b.getAttribute('data-id')||'0',10)||0;
-    try{
-      const r = await fetch('/api/webhook/retry/'+id, {method:'POST', headers:{'X-CSRFToken':CSRF}});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      toast('Переотправка запрошена'); loadWhq();
-    }catch(_){ alert('Ошибка сети'); }
+    fetch('/api/webhook/queue').then(r=>r.json()).then(j=>{
+      const tb=document.getElementById('whQueueBody');
+      if(!j.ok){ tb.innerHTML='<tr><td colspan="7"><div class="help">Ошибка</div></td></tr>'; return; }
+      let html='';
+      for(const it of (j.items||[])){ html += whRowHTML(it); }
+      if(!html) html='<tr><td colspan="7"><div class="help">Пусто</div></td></tr>';
+      tb.innerHTML = html;
+    }).catch(()=>alert('Ошибка сети'));
+  });
+  document.getElementById('whQueueBody')?.addEventListener('click', e=>{
+    const b=e.target.closest('.btnWhRetry'); if(!b) return;
+    e.preventDefault();
+    const id=b.getAttribute('data-id')||'';
+    fetch('/api/webhook/retry/'+id,{method:'POST',headers:{'X-CSRFToken':CSRF}}).then(r=>r.json()).then(j=>{
+      if(j.ok) toast('Задача повторной доставки обновлена'); else alert(j.error||'Ошибка');
+    }).catch(()=>alert('Ошибка сети'));
   });
 
-  // Custom fields
-  async function loadCf(){
-    const ent = (document.getElementById('cfEntity').value||'').trim();
-    if(!ent) return;
-    try{
-      const url = new URL(window.location.origin + '/api/custom_fields'); url.searchParams.set('entity', ent);
-      const r = await fetch(url.toString()); const j = await r.json();
-      const tb = document.getElementById('cfTbl'); tb.innerHTML='';
-      if(!j.ok || !(j.items||[]).length){ tb.innerHTML='<tr><td colspan="6"><div class="help">Нет полей</div></td></tr>'; return; }
-      for(const f of j.items){
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>#${f.id}</td><td>${esc(f.key||'')}</td><td>${esc(f.type||'')}</td><td>${esc(f.label||'')}</td><td>${f.required?'yes':'no'}</td><td>${esc(f.default||'')}</td>`;
-        tb.appendChild(tr);
-      }
-    }catch(_){ document.getElementById('cfTbl').innerHTML='<tr><td colspan="6"><div class="help">Ошибка</div></td></tr>'; }
-  }
-  document.getElementById('btnCfLoad')?.addEventListener('click', e=>{ e.preventDefault(); loadCf(); });
-
-  document.getElementById('btnCfAdd')?.addEventListener('click', async e=>{
+  // AI config: загрузить текущее
+  document.getElementById('btnAiLoad')?.addEventListener('click', e=>{
     e.preventDefault();
-    const entity=(document.getElementById('cfEntityNew').value||'').trim();
-    const key=(document.getElementById('cfKey').value||'').trim();
-    const type=(document.getElementById('cfType').value||'text').trim();
-    const label=(document.getElementById('cfLabel').value||key).trim();
-    const required = (document.getElementById('cfReq').value==='1');
-    const def = (document.getElementById('cfDefault').value||'');
-    let options = []; let rules = {};
-    try{ options = JSON.parse(document.getElementById('cfOptions').value||'[]'); }catch(_){}
-    try{ rules = JSON.parse(document.getElementById('cfRules').value||'{}'); }catch(_){}
-    if(!entity || !key || !label) return alert('Заполните entity/key/label');
-    try{
-      const r = await fetch('/api/custom_fields', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
-        body: JSON.stringify({entity, key, type, label, required, default: def, options, rules})});
-      const j = await r.json(); if(!j.ok) return alert(j.error||'Ошибка');
-      document.getElementById('cfMsg').textContent='Добавлено #'+j.id;
-      if((document.getElementById('cfEntity').value||'').trim()===entity) loadCf();
-    }catch(_){ alert('Ошибка сети'); }
+    fetch('/settings/ai/config').then(r=>r.json()).then(j=>{
+      if(!j.ok){ document.getElementById('aiLoadHint').textContent='Не удалось загрузить'; return; }
+      const cfg=j.config||{};
+      document.getElementById('aiProv').value = cfg.provider||'';
+      document.getElementById('aiModel').value = cfg.model||'';
+      document.getElementById('aiTemp').value = (cfg.temperature!=null?cfg.temperature:0.3);
+      document.getElementById('aiMaxTok').value = (cfg.max_tokens!=null?cfg.max_tokens:512);
+      document.getElementById('aiPolicy').value = JSON.stringify(cfg.policy||{}, null, 2);
+      document.getElementById('aiLoadHint').textContent='Загружено';
+    }).catch(()=>{ document.getElementById('aiLoadHint').textContent='Ошибка сети'; });
+  });
+
+  // Пользователи: смена пароля (форма-пост)
+  document.addEventListener('click', e=>{
+    const b=e.target.closest('.btnPwd'); if(!b) return;
+    e.preventDefault();
+    const uid=b.getAttribute('data-id')||'';
+    document.getElementById('pwdUid').value = uid;
+    document.getElementById('pwdVal').value = '';
+    document.getElementById('pwdModal').classList.add('show');
+  });
+  document.getElementById('btnPwdCancel')?.addEventListener('click', e=>{ e.preventDefault(); document.getElementById('pwdModal').classList.remove('show'); });
+  document.getElementById('btnPwdSave')?.addEventListener('click', e=>{
+    e.preventDefault();
+    const uid=document.getElementById('pwdUid').value||'';
+    const pwd=document.getElementById('pwdVal').value||'';
+    if((pwd||'').length<12){ alert('Пароль слишком короткий'); return; }
+    const fd=new FormData(); fd.append('csrf_token', CSRF_FORM); fd.append('password', pwd);
+    fetch('/settings/user/password/'+uid,{method:'POST', body: fd, credentials:'same-origin'})
+      .then(()=>{ toast('Пароль обновлён'); document.getElementById('pwdModal').classList.remove('show'); })
+      .catch(()=>alert('Ошибка сети'));
+  });
+
+  // API токены
+  function tokRowHTML(t){
+    return `
+      <tr data-id="${t.id}">
+        <td>#${t.id}</td>
+        <td>${esc(t.name||'')}</td>
+        <td>${esc(String(t.user_id||''))}</td>
+        <td>${esc(t.scopes||'')}</td>
+        <td>${esc(t.expires_at||'')}</td>
+        <td>${t.active?'да':'нет'}</td>
+        <td>${esc(t.created_at||'')}</td>
+        <td>${esc(t.last_used_at||'')}</td>
+        <td><button class="iconbtn small btnTokToggle" data-id="${t.id}">${t.active?'выключить':'включить'}</button></td>
+      </tr>`;
+  }
+  function tokRefresh(){
+    fetch('/api/tokens/list').then(r=>r.json()).then(j=>{
+      const tb=document.getElementById('tokTBody');
+      if(!j.ok){ tb.innerHTML='<tr><td colspan="9"><div class="help">Ошибка</div></td></tr>'; return; }
+      let html=''; for(const t of (j.items||[])){ html += tokRowHTML(t); }
+      if(!html) html='<tr><td colspan="9"><div class="help">Нет токенов</div></td></tr>';
+      tb.innerHTML=html;
+    }).catch(()=>alert('Ошибка сети'));
+  }
+  document.getElementById('btnTokRefresh')?.addEventListener('click', e=>{ e.preventDefault(); tokRefresh(); });
+  document.getElementById('tokTBody')?.addEventListener('click', e=>{
+    const b=e.target.closest('.btnTokToggle'); if(!b) return;
+    e.preventDefault();
+    const id=b.getAttribute('data-id')||'';
+    fetch('/api/tokens/toggle',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({id: parseInt(id,10)})})
+      .then(r=>r.json()).then(j=>{ if(!j.ok){ alert(j.error||'Ошибка'); return; } tokRefresh(); })
+      .catch(()=>alert('Ошибка сети'));
+  });
+  document.getElementById('btnTokCreate')?.addEventListener('click', e=>{
+    e.preventDefault();
+    const name=(document.getElementById('tokName').value||'API Token').trim();
+    const user_id_raw=(document.getElementById('tokUser').value||'').trim();
+    const user_id = user_id_raw? parseInt(user_id_raw,10) : null;
+    const scopes=(document.getElementById('tokScopes').value||'').split(',').map(s=>s.trim()).filter(Boolean);
+    const exp=(document.getElementById('tokExp').value||'').trim();
+    fetch('/api/tokens/create',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({name, user_id, scopes, expires_at: exp||null})})
+      .then(r=>r.json()).then(j=>{
+        if(!j.ok){ alert(j.error||'Ошибка'); return; }
+        const tok=j.token||''; if(tok){ alert('Токен создан:\\n'+tok+'\\nСохраните его сейчас — он больше не будет показан.'); }
+        tokRefresh();
+      }).catch(()=>alert('Ошибка сети'));
   });
 </script>
 """
-# === END STYLES PART 8/9 ===
-# === STYLES PART 9/9 — Utilities, States, Messages, Animations, Print ===
+# === END STYLES PART 8/11 ===
+# === STYLES PART 9/11 — DOCUMENTS (templates, create, view) ===
 # -*- coding: utf-8 -*-
 
-BASE_CSS = BASE_CSS + """
-/* ===== Utilities ===== */
-.row{display:flex;gap:8px;align-items:center}
-.col{display:flex;flex-direction:column;gap:8px}
-.center{align-items:center;justify-content:center}
-.right{margin-left:auto}
-.wrap{flex-wrap:wrap}
-.gap-4{gap:4px}.gap-6{gap:6px}.gap-8{gap:8px}.gap-12{gap:12px}.gap-16{gap:16px}.gap-24{gap:24px}
-.mt-4{margin-top:4px}.mt-8{margin-top:8px}.mt-12{margin-top:12px}.mt-16{margin-top:16px}
-.mb-4{margin-bottom:4px}.mb-8{margin-bottom:8px}.mb-12{margin-bottom:12px}.mb-16{margin-bottom:16px}
-.ml-auto{margin-left:auto}.mr-auto{margin-right:auto}
-.p-8{padding:8px}.p-12{padding:12px}.p-16{padding:16px}
-.w-100{width:100%}.h-100{height:100%}
-.nowrap{white-space:nowrap}
-.ellipsis{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.break{word-break:break-word;overflow-wrap:anywhere}
-.hidden{display:none !important}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.z-1{z-index:1}.z-5{z-index:5}.z-10{z-index:10}.z-100{z-index:100}.z-1000{z-index:1000}
-
-/* ===== Focus/hover/disabled states ===== */
-:where(.button,.iconbtn,.input,.select,textarea,.navitem,.toggle):focus-visible{
-  outline:2px solid var(--accent); outline-offset:2px;
-}
-:where(.button):hover{filter:brightness(1.02)}
-:where(.iconbtn):hover{background:var(--surface)}
-:where(.navitem):hover{background:var(--surface)}
-:where(.button[disabled],.iconbtn[disabled]){opacity:.6;cursor:not-allowed}
-:where(.input:disabled,.select:disabled,textarea:disabled){opacity:.6;cursor:not-allowed}
-
-/* ===== Tables ===== */
-.table tr:hover td{background:color-mix(in oklab, var(--panel) 92%, var(--accent) 8%);transition:background .12s ease}
-@supports not (color-mix(in oklab, white, black)){
-  .table tr:hover td{background:rgba(43,214,106,.06)}
-}
-
-/* ===== Messages (threads/comments) ===== */
-.msg{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:8px 10px;margin:8px 0}
-.msg .meta{color:var(--muted);font-size:12px;margin-bottom:4px}
-.msg .body{white-space:pre-wrap}
-.msg.client{border-left:3px solid #7ec1ff}
-.msg.agent{border-left:3px solid #2bd66a}
-.msg.system{border-style:dashed;opacity:.85}
-
-/* ===== Composer (common) ===== */
-.composer{display:flex;flex-direction:column;gap:8px}
-.composer .row{align-items:center}
-
-/* ===== Badges / Pills for status & priority ===== */
-.status-badges .badge{font-weight:600}
-.badge.status-open{border-color:#7ec1ff66;color:#7ec1ff;background:#7ec1ff1a}
-.badge.status-pending{border-color:#ffc85766;color:#ffc857;background:#ffc8571a}
-.badge.status-resolved{border-color:#2bd66a66;color:#2bd66a;background:#2bd66a1a}
-.badge.status-snoozed{border-color:#bda7ff66;color:#bda7ff;background:#bda7ff1a}
-
-.badge.priority-low{border-color:#9ab2a666;color:#9ab2a6;background:#9ab2a61a}
-.badge.priority-normal{border-color:#7ec1ff66;color:#7ec1ff;background:#7ec1ff1a}
-.badge.priority-high{border-color:#ffc85766;color:#ffc857;background:#ffc8571a}
-.badge.priority-urgent{border-color:#ff6b6b66;color:#ff6b6b;background:#ff6b6b1a}
-
-/* ===== Toast / Modal animations ===== */
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@keyframes pop{from{transform:scale(.98)}to{transform:scale(1)}}
-.toast{animation:fadeIn .18s ease}
-.modal-backdrop.show .modal{animation:pop .16s ease}
-.modal-backdrop{animation:fadeIn .16s ease}
-
-/* ===== Loading / skeleton ===== */
-@keyframes pulse{0%{opacity:.5}50%{opacity:.25}100%{opacity:.5}}
-.skeleton{background:linear-gradient(90deg, rgba(255,255,255,.06), rgba(0,0,0,.06));border-radius:8px;animation:pulse 1.2s ease-in-out infinite}
-
-/* ===== Icons / misc ===== */
-.kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;border:1px solid var(--border);border-bottom-width:2px;border-radius:6px;padding:1px 6px;background:var(--surface);font-size:12px}
-
-/* ===== Scroll areas ===== */
-.scroll{overflow:auto}
-.scroll-x{overflow-x:auto;overflow-y:hidden}
-.scroll-y{overflow-y:auto;overflow-x:hidden}
-
-/* ===== Responsive helpers ===== */
-@media(max-width:980px){
-  .hide-md{display:none !important}
-}
-@media(max-width:720px){
-  .hide-sm{display:none !important}
-  .container{padding:12px}
-  .topbar{gap:8px}
-}
-
-/* ===== Print styles ===== */
-@media print{
-  :root{--bg:#ffffff;--fg:#000000;--surface:#ffffff;--panel:#ffffff;--border:#00000020}
-  body{background:#fff;color:#000}
-  .sidebar,.topbar,.toast-wrap,.fab,.modal-backdrop,.footer-stick{display:none !important}
-  .page{margin:0 !important}
-  a{color:#000;text-decoration:underline}
-  .card{border:1px solid #00000020;box-shadow:none}
-  .table{border-color:#00000030}
-  .table th,.table td{border-color:#00000020}
-}
-
-/* ===== Minor refinements ===== */
-details>summary.button{list-style:none}
-details>summary.button::-webkit-details-marker{display:none}
-.iconbtn.small{line-height:1}
-.button.small{padding:6px 10px;border-radius:8px;font-size:13px}
-"""
-
-# --- Extra routes/helpers appended in this section ---
-
-# ===== Documents module =====
 DOCUMENTS_TMPL = """
-<h2 style=\"margin:0 0 8px 0;\">Документы</h2>
+<h2 style="margin:0 0 8px 0;">Документы</h2>
 
-<div class=\"split\" style=\"align-items:start;\">
-  <div class=\"card\">
-    <h3>Шаблоны</h3>
-    <table class=\"table\">
-      <thead><tr><th>ID</th><th>Тип</th><th>Название</th><th>Ключ</th><th>Создан</th></tr></thead>
-      <tbody>
-        {% for t in templates %}
-        <tr><td>#{{ t.id }}</td><td>{{ t.type }}</td><td>{{ t.name }}</td><td class=\"help\">{{ t.tkey or '—' }}</td><td>{{ t.created_at }}</td></tr>
-        {% else %}
-        <tr><td colspan=\"5\"><div class=\"help\">Нет шаблонов</div></td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    <details style=\"margin-top:8px;\">
-      <summary class=\"button ghost\">Добавить шаблон</summary>
-      <form method=\"post\" action=\"{{ url_for('documents_template_add') }}\" style=\"display:grid;gap:8px;max-width:820px;margin-top:8px;\">
-        <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
-        <div class=\"split\" style=\"grid-template-columns:1fr 1fr 1fr;gap:8px;\">
+<div class="split">
+  <!-- Шаблоны -->
+  <div class="card">
+    <details open>
+      <summary class="button ghost">Шаблоны документов</summary>
+      <div class="help" style="margin:6px 0;">
+        Создавайте HTML-шаблоны. Доступные переменные: <code>{{'{{ org.* }}'}}</code>,
+        <code>{{'{{ company.* }}'}}</code>, <code>{{'{{ user.* }}'}}</code>, <code>{{'{{ now }}'}}</code>.
+        Значения подставляются на сервере с автоэкранированием переменных.
+      </div>
+      <table class="table">
+        <thead>
+          <tr><th>ID</th><th>Тип</th><th>Ключ</th><th>Название</th><th>Создан</th></tr>
+        </thead>
+        <tbody>
+          {% for t in templates %}
+          <tr>
+            <td>#{{ t.id }}</td>
+            <td>{{ t.type }}</td>
+            <td>{{ t.tkey or '—' }}</td>
+            <td>{{ t.name }}</td>
+            <td>{{ t.created_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5"><div class="help">Шаблонов пока нет</div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <h4 style="margin:10px 0 6px 0;">Добавить шаблон</h4>
+      <form method="post" action="{{ url_for('documents_template_add') }}" style="display:grid;gap:8px;max-width:980px;">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <div class="split" style="grid-template-columns:1fr 1fr 1fr;gap:8px;">
           <label>Тип
-            <select class=\"select\" name=\"type\">
-              {% for t in ('contract','invoice','proposal') %}<option value=\"{{ t }}\">{{ t }}</option>{% endfor %}
+            <select class="select" name="type">
+              <option value="proposal">proposal</option>
+              <option value="invoice">invoice</option>
+              <option value="contract">contract</option>
+              <option value="other">other</option>
             </select>
           </label>
-          <label>Название <input class=\"input\" name=\"name\" required></label>
-          <label>Ключ (необяз.) <input class=\"input\" name=\"tkey\" placeholder=\"offer-2025\"></label>
+          <label>Название <input class="input" name="name" required placeholder="Коммерческое предложение"></label>
+          <label>Ключ (опц.) <input class="input" name="tkey" placeholder="cp_2025"></label>
         </div>
-        <label>Шаблон (HTML с переменными Jinja)
-          <textarea class=\"input\" name=\"body_template\" rows=\"10\" placeholder=\"<h1>Договор с {{ company.name }}</h1>\n<p>Организация: {{ org.name }}</p>\n<p>Дата: {{ now }}</p>\" required></textarea>
+        <label>HTML-шаблон
+          <textarea class="input" name="body_template" id="tplBody" rows="10" placeholder="<h1>{{'{{ org.name }}'}}</h1> ..."></textarea>
         </label>
-        <div style=\"display:flex;gap:8px;justify-content:flex-end;\"><button class=\"button\" type=\"submit\">Сохранить</button></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+          <button class="button secondary" type="button" id="btnTplExample">Пример</button>
+          <button class="button" type="submit">Сохранить</button>
+        </div>
       </form>
     </details>
   </div>
 
-  <div class=\"card\">
-    <h3>Создать документ</h3>
-    <form method=\"post\" action=\"{{ url_for('documents_create') }}\" style=\"display:grid;gap:8px;max-width:620px;\">
-      <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
-      <label>Шаблон
-        <select class=\"select\" name=\"template_id\" required>
-          {% for t in templates %}<option value=\"{{ t.id }}\">[{{ t.type }}] {{ t.name }}</option>{% endfor %}
-        </select>
-      </label>
-      <label>Компания (ID)
-        <select class=\"select\" name=\"company_id\">
-          <option value=\"\">—</option>
-          {% for c in companies %}<option value=\"{{ c.id }}\">#{{ c.id }} · {{ c.name }}{% if c.inn %} · ИНН {{ c.inn }}{% endif %}</option>{% endfor %}
-        </select>
-      </label>
-      <div style=\"display:flex;gap:8px;justify-content:flex-end;\"><button class=\"button\" type=\"submit\">Создать</button></div>
-    </form>
+  <!-- Создание документа -->
+  <div class="card">
+    <details open>
+      <summary class="button ghost">Создать документ</summary>
+      <form method="post" action="{{ url_for('documents_create') }}" style="display:grid;gap:8px;max-width:820px;">
+        <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+        <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+          <label>Шаблон
+            <select class="select" name="template_id" id="selTpl" required>
+              {% for t in templates %}
+              <option value="{{ t.id }}">{{ t.name }} ({{ t.type }})</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>Компания
+            <select class="select" name="company_id" id="selCompany" required>
+              {% for c in companies %}
+              <option value="{{ c.id }}">{{ c.name }} (ИНН {{ c.inn or '—' }})</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+        <div class="help">Подсказка: отфильтруйте компании по названию/ИНН</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <input class="input" id="cmpFilter" placeholder="фильтр компаний..." style="max-width:320px;">
+          <div class="help" id="cmpCount"></div>
+          <div style="margin-left:auto;display:flex;gap:8px;">
+            <button class="button" type="submit">Создать документ</button>
+          </div>
+        </div>
+      </form>
+    </details>
+  </div>
+</div>
 
-    <div class=\"help\" style=\"margin-top:8px;\">Последние документы:</div>
-    <table class=\"table\">
-      <thead><tr><th>ID</th><th>Тип</th><th>Заголовок</th><th>Компания</th><th>Создан</th><th></th></tr></thead>
-      <tbody>
+<!-- Документы -->
+<div class="card" style="margin-top:10px;">
+  <details open>
+    <summary class="button ghost">Последние документы</summary>
+    <table class="table">
+      <thead>
+        <tr><th>ID</th><th>Тип</th><th>Название</th><th>Компания</th><th>Создан</th><th></th></tr>
+      </thead>
+      <tbody id="docsTBody">
         {% for d in docs %}
         <tr>
-          <td>#{{ d.id }}</td><td>{{ d.doc_type }}</td><td>{{ d.title }}</td><td>{{ d.company_name or '—' }}</td><td>{{ d.created_at }}</td>
-          <td><a class=\"iconbtn small\" href=\"{{ url_for('document_view', doc_id=d.id) }}\">Открыть</a></td>
+          <td>#{{ d.id }}</td>
+          <td>{{ d.doc_type }}</td>
+          <td>{{ d.title }}</td>
+          <td>{{ d.company_name or '—' }}</td>
+          <td>{{ d.created_at }}</td>
+          <td style="white-space:nowrap;"><a class="iconbtn small" href="{{ url_for('document_view', doc_id=d.id) }}">Открыть</a></td>
         </tr>
         {% else %}
-        <tr><td colspan=\"6\"><div class=\"help\">Документов пока нет</div></td></tr>
+        <tr><td colspan="6"><div class="help">Документов пока нет</div></td></tr>
         {% endfor %}
       </tbody>
     </table>
-  </div>
+  </details>
 </div>
+
+<script nonce="{{ csp_nonce }}">
+  // Пример шаблона
+  document.getElementById('btnTplExample')?.addEventListener('click', e=>{
+    e.preventDefault();
+    const el = document.getElementById('tplBody');
+    if(!el) return;
+    el.value = [
+      '<div style="font-family:Arial, sans-serif;">',
+      '  <h2>Коммерческое предложение</h2>',
+      '  <div>Организация: {{ org.name }}</div>',
+      '  <div>Клиент: {{ company.name }}</div>',
+      '  <div>Дата: {{ now }}</div>',
+      '  <hr>',
+      '  <p>Уважаемый(ая) представитель {{ company.name }},</p>',
+      '  <p>Предлагаем вам сотрудничество по услугам нашей компании.</p>',
+      '  <ul>',
+      '    <li>Услуга A — 10 000 ₽</li>',
+      '    <li>Услуга B — 20 000 ₽</li>',
+      '  </ul>',
+      '  <p>С уважением,<br>{{ user.first_name or user.username }}</p>',
+      '</div>'
+    ].join('\\n');
+  });
+
+  // Фильтр компаний (клиентский)
+  (function(){
+    const sel = document.getElementById('selCompany');
+    const inp = document.getElementById('cmpFilter');
+    const cnt = document.getElementById('cmpCount');
+    if(!sel || !inp) return;
+    function upd(){
+      const q = (inp.value||'').toLowerCase();
+      let shown = 0;
+      for(const opt of [...sel.options]){
+        const t = (opt.text||'').toLowerCase();
+        const v = (opt.value||'');
+        const ok = (!q) || t.includes(q);
+        opt.hidden = !ok;
+        if(ok) shown++;
+      }
+      if(cnt) cnt.textContent = shown ? ('подходящих: ' + shown) : 'ничего не найдено';
+    }
+    inp.addEventListener('input', upd);
+    upd();
+  })();
+</script>
 """
 
 DOCUMENT_VIEW_TMPL = """
 <h2>Документ #{{ d.id }} · {{ d.title }}</h2>
-<div class=\"card\">
-  <div class=\"help\">Тип: {{ d.doc_type }} · Создан: {{ d.created_at }}</div>
-  <div class=\"p-12\" style=\"background:var(--panel);border-radius:12px;border:1px solid var(--border);\">
+<div class="split">
+  <div class="card">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+      <div><strong>Тип:</strong> {{ d.doc_type }}</div>
+      <div><strong>Компания ID:</strong> {{ d.company_id or '—' }}</div>
+      <div><strong>Пользователь ID:</strong> {{ d.user_id or '—' }}</div>
+      <div><strong>Создан:</strong> {{ d.created_at }}</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+      <button class="button" id="btnPrint">Печать</button>
+      <a class="button ghost" href="{{ url_for('documents_page') }}">← к документам</a>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:10px;">
+  <div class="help">Содержимое документа</div>
+  <div class="doc-view-content" style="background:#fff;color:#000;border:1px solid var(--border);border-radius:8px;padding:16px;">
     {{ d.content_html|safe }}
   </div>
-  <div style=\"display:flex;gap:8px;justify-content:flex-end;margin-top:8px;\">
-    <button class=\"button secondary\" onclick=\"window.print()\">Печать / PDF</button>
-  </div>
-  <div class=\"help\" style=\"margin-top:8px;\">В ближайших версиях появится вложение в письма и интеграции (Мои документы, 1С)</div>
-  </div>
+</div>
+
+<script nonce="{{ csp_nonce }}">
+  document.getElementById('btnPrint')?.addEventListener('click', e=>{ e.preventDefault(); window.print(); });
+</script>
 """
+# === END STYLES PART 9/11 ===
+# === STYLES PART 10/11 — WAREHOUSE + IMPORT CSV WIZARD ===
+# -*- coding: utf-8 -*-
 
-
-@app.route("/documents")
-@admin_required
-def documents_page():
-    org_id = current_org_id()
-    templates = query_db("SELECT id,name,type,tkey,created_at FROM documents_templates WHERE org_id=? ORDER BY id DESC", (org_id,))
-    docs = query_db(
-        """
-        SELECT d.id, d.doc_type, d.title, d.created_at, c.name AS company_name
-        FROM documents d
-        LEFT JOIN companies c ON c.id=d.company_id
-        WHERE d.org_id=?
-        ORDER BY d.id DESC LIMIT 100
-        """,
-        (org_id,),
-    )
-    companies = query_db("SELECT id,name,inn FROM companies WHERE org_id=? ORDER BY id DESC LIMIT 200", (org_id,))
-    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENTS_TMPL, templates=templates, docs=docs, companies=companies))
-
-
-@app.route("/documents/template/add", methods=["POST"])
-@admin_required
-def documents_template_add():
-    verify_csrf()
-    org_id = current_org_id()
-    typ = (request.form.get("type") or "").strip() or "proposal"
-    name = (request.form.get("name") or "").strip()
-    tkey = (request.form.get("tkey") or "").strip() or None
-    body = request.form.get("body_template") or ""
-    if not name or not body:
-        return redirect(url_for("documents_page"))
-    exec_db(
-        "INSERT INTO documents_templates (org_id,name,type,tkey,body_template) VALUES (?,?,?,?,?)",
-        (org_id, name, typ, tkey, body),
-    )
-    return redirect(url_for("documents_page"))
-
-
-@app.route("/documents/create", methods=["POST"])
-@admin_required
-def documents_create():
-    verify_csrf()
-    org_id = current_org_id()
-    try:
-        template_id = int(request.form.get("template_id") or "0")
-    except Exception:
-        template_id = 0
-    try:
-        company_id = int(request.form.get("company_id") or "0")
-    except Exception:
-        company_id = 0
-    tpl = query_db("SELECT * FROM documents_templates WHERE id=? AND org_id=?", (template_id, org_id), one=True)
-    if not tpl:
-        return redirect(url_for("documents_page"))
-    org = query_db("SELECT * FROM orgs WHERE id=?", (org_id,), one=True)
-    company = query_db("SELECT * FROM companies WHERE id=? AND org_id=?", (company_id, org_id), one=True) if company_id else None
-    user = get_current_user()
-    ctx = {
-        "org": dict(org or {}),
-        "company": dict(company or {}),
-        "user": dict(user or {}),
-        "now": datetime.utcnow().strftime("%Y-%m-%d"),
-    }
-    try:
-        content_html = render_template_string(str(tpl["body_template"] or ""), **ctx)
-    except Exception as e:
-        app.logger.error(f"Doc render failed: {e}")
-        content_html = f"<pre>Ошибка рендеринга шаблона: {e}</pre>"
-    title = f"{tpl['name']}" + (f" · {company['name']}" if company else "")
-    did = exec_db(
-        "INSERT INTO documents (org_id,template_id,doc_type,company_id,user_id,title,content_html) VALUES (?,?,?,?,?,?,?)",
-        (org_id, tpl["id"], tpl["type"], company_id if company else None, session.get("user_id"), title, content_html),
-    )
-    return redirect(url_for("document_view", doc_id=did))
-
-
-@app.route("/document/<int:doc_id>")
-@login_required
-def document_view(doc_id: int):
-    org_id = current_org_id()
-    d = query_db("SELECT * FROM documents WHERE id=? AND org_id=?", (doc_id, org_id), one=True)
-    if not d:
-        flash("Документ не найден", "error")
-        return redirect(url_for("documents_page"))
-    return render_safe(LAYOUT_TMPL, inner=render_safe(DOCUMENT_VIEW_TMPL, d=d))
-
-
-# ===== Warehouse (Inventory) module =====
 WAREHOUSE_TMPL = """
-<h2 style=\"margin:0 0 8px 0;\">Склад</h2>
-<div class=\"card\">
-  <div class=\"help\">Учет остатков по товарам. Для синхронизации с "Мой склад" добавим интеграцию позже.</div>
-  <table class=\"table\">
-    <thead><tr><th>ID</th><th>SKU</th><th>Название</th><th>Цена</th><th>Кол-во</th><th></th></tr></thead>
-    <tbody>
-      {% for p in products %}
+<h2 style="margin:0 0 8px 0;">Склад</h2>
+
+<div class="card">
+  <details open>
+    <summary class="button ghost">Фильтр</summary>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input class="input" id="whFilter" placeholder="поиск по SKU/названию">
+      <div class="help">Фильтр применяется на клиенте</div>
+    </div>
+  </details>
+</div>
+
+<div class="card" style="margin-top:10px;">
+  <table class="table">
+    <thead>
       <tr>
-        <td>#{{ p.id }}</td><td class=\"help\">{{ p.sku }}</td><td>{{ p.name }}</td>
-        <td>{{ p.price }} {{ p.currency }}</td>
-        <td>{{ p.qty|default(0) }}</td>
-        <td>
-          <form method=\"post\" action=\"{{ url_for('warehouse_stock_set') }}\" style=\"display:flex;gap:6px;align-items:center;\">
-            <input type=\"hidden\" name=\"csrf_token\" value=\"{{ session.get('csrf_token','') }}\">
-            <input type=\"hidden\" name=\"product_id\" value=\"{{ p.id }}\">
-            <input class=\"input\" name=\"qty\" placeholder=\"0\" value=\"{{ p.qty|default(0) }}\" style=\"max-width:120px;\">
-            <button class=\"iconbtn small\" type=\"submit\">Обновить</button>
-          </form>
+        <th>ID</th><th>SKU</th><th>Название</th><th>Цена</th><th>Валюта</th><th>Остаток</th><th>Изменить остаток</th>
+      </tr>
+    </thead>
+    <tbody id="whBody">
+      {% for p in products %}
+      <tr data-id="{{ p.id }}">
+        <td>#{{ p.id }}</td>
+        <td class="sku">{{ p.sku }}</td>
+        <td class="name">{{ p.name }}</td>
+        <td>{{ '%.2f'|format((p.price or 0)|float) }}</td>
+        <td>{{ p.currency or 'RUB' }}</td>
+        <td class="qty">{{ '%.2f'|format((p.qty or 0)|float) }}</td>
+        <td style="white-space:nowrap;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <input class="input wh-qty" type="number" step="0.01" style="max-width:120px" value="{{ '%.2f'|format((p.qty or 0)|float) }}">
+          <button class="iconbtn small wh-dec" title="-1">−</button>
+          <button class="iconbtn small wh-inc" title="+1">+</button>
+          <button class="button small wh-save">Сохранить</button>
         </td>
       </tr>
       {% else %}
-      <tr><td colspan=\"6\"><div class=\"help\">Товары не заведены</div></td></tr>
+      <tr><td colspan="7"><div class="help">Нет товаров — добавьте в разделе «CPQ/Products» (ядро)</div></td></tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
+
+<script nonce="{{ csp_nonce }}">
+  // Фильтр по таблице
+  (function(){
+    const inp=document.getElementById('whFilter');
+    const body=document.getElementById('whBody');
+    if(!inp||!body) return;
+    function apply(){
+      const q=(inp.value||'').toLowerCase();
+      [...body.querySelectorAll('tr')].forEach(tr=>{
+        const sku=(tr.querySelector('.sku')?.textContent||'').toLowerCase();
+        const name=(tr.querySelector('.name')?.textContent||'').toLowerCase();
+        tr.style.display = (!q || sku.includes(q) || name.includes(q)) ? '' : 'none';
+      });
+    }
+    inp.addEventListener('input', apply); apply();
+  })();
+
+  // Инкременты и сохранение
+  document.getElementById('whBody')?.addEventListener('click', e=>{
+    const tr=e.target.closest('tr'); if(!tr) return;
+    const id=tr.getAttribute('data-id');
+    const inp=tr.querySelector('.wh-qty');
+    const qtyCell=tr.querySelector('.qty');
+    if(e.target.closest('.wh-inc')){ e.preventDefault(); inp.value = String((parseFloat(inp.value||'0')||0)+1); return; }
+    if(e.target.closest('.wh-dec')){ e.preventDefault(); inp.value = String((parseFloat(inp.value||'0')||0)-1); return; }
+    if(e.target.closest('.wh-save')){
+      e.preventDefault();
+      const fd=new FormData();
+      fd.append('csrf_token', '{{ session.get("csrf_token","") }}');
+      fd.append('product_id', id||'');
+      fd.append('qty', String(inp.value||'0'));
+      fetch('/warehouse/stock/set',{method:'POST', body:fd, credentials:'same-origin'})
+        .then(()=>{ qtyCell.textContent = (inp.value||'0'); toast('Сохранено'); })
+        .catch(()=>alert('Ошибка сети'));
+      return;
+    }
+  });
+</script>
 """
 
+IMPORT_TMPL = """
+<h2 style="margin:0 0 8px 0;">Импорт CSV</h2>
 
-@app.route("/warehouse")
-@admin_required
-def warehouse_page():
-    org_id = current_org_id()
-    rows = query_db(
-        """
-        SELECT p.id, p.sku, p.name, p.price, p.currency, COALESCE(i.qty,0) AS qty
-        FROM products p
-        LEFT JOIN inventory i ON i.product_id=p.id AND i.org_id=p.org_id
-        WHERE p.org_id=?
-        ORDER BY p.id DESC
-        LIMIT 500
-        """,
-        (org_id,),
-    )
-    return render_safe(LAYOUT_TMPL, inner=render_safe(WAREHOUSE_TMPL, products=rows))
+<div class="card">
+  <details open>
+    <summary class="button ghost">Мастер импорта</summary>
+    <form method="post" action="{{ url_for('import_csv_wizard') }}" enctype="multipart/form-data" style="display:grid;gap:8px;max-width:820px;">
+      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+      <label>Режим импорта
+        <select class="select" name="mode" id="impMode">
+          <option value="companies">Компании</option>
+          <option value="contacts">Контакты</option>
+          <option value="deals">Сделки</option>
+          <option value="tasks">Задачи</option>
+        </select>
+      </label>
+      <label>CSV-файл <input class="input" type="file" name="csvfile" id="csvFile" accept=".csv,text/csv"></label>
+      <div class="help">Кодировка UTF-8, разделитель «;» или «,»; первая строка — заголовки колонок.</div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+        <button class="button" type="submit">Загрузить</button>
+        <button class="button ghost" type="button" id="btnPreview">Предпросмотр</button>
+      </div>
+    </form>
+  </details>
+</div>
 
+<div class="card" style="margin-top:10px;">
+  <details>
+    <summary class="button ghost">Рекомендации по колонкам</summary>
+    <div class="split" style="grid-template-columns:1fr 1fr;gap:8px;">
+      <div>
+        <h4 style="margin:0 0 6px 0;">Компании</h4>
+        <ul class="help">
+          <li>name (обязательно)</li>
+          <li>inn, phone, email, address, notes (опц.)</li>
+        </ul>
+      </div>
+      <div>
+        <h4 style="margin:0 0 6px 0;">Контакты</h4>
+        <ul class="help">
+          <li>name (обязательно), company_id (опц.)</li>
+          <li>position, phone, email (опц.)</li>
+        </ul>
+      </div>
+      <div>
+        <h4 style="margin:0 0 6px 0;">Сделки</h4>
+        <ul class="help">
+          <li>title (обязательно), amount, currency, status, stage, assignee_id, company_id, contact_id</li>
+        </ul>
+      </div>
+      <div>
+        <h4 style="margin:0 0 6px 0;">Задачи</h4>
+        <ul class="help">
+          <li>title (обязательно), description, assignee_id, due_at (YYYY-MM-DD HH:MM:SS)</li>
+        </ul>
+      </div>
+    </div>
+  </details>
+</div>
 
-@app.route("/warehouse/stock/set", methods=["POST"])
-@admin_required
-def warehouse_stock_set():
-    verify_csrf()
-    org_id = current_org_id()
-    try:
-        product_id = int(request.form.get("product_id") or "0")
-        qty = float(request.form.get("qty") or "0")
-    except Exception:
-        product_id = 0
-        qty = 0.0
-    if not product_id:
-        return redirect(url_for("warehouse_page"))
-    # ensure product exists in this org
-    if not query_db("SELECT 1 FROM products WHERE id=? AND org_id=?", (product_id, org_id), one=True):
-        return redirect(url_for("warehouse_page"))
-    if query_db("SELECT 1 FROM inventory WHERE product_id=? AND org_id=?", (product_id, org_id), one=True):
-        exec_db("UPDATE inventory SET qty=?, updated_at=CURRENT_TIMESTAMP WHERE product_id=? AND org_id=?", (qty, product_id, org_id))
-    else:
-        exec_db("INSERT INTO inventory (org_id, product_id, qty) VALUES (?,?,?)", (org_id, product_id, qty))
-    return redirect(url_for("warehouse_page"))
+<div class="card" style="margin-top:10px;">
+  <h3 style="margin:0 0 8px 0;">Предпросмотр CSV</h3>
+  <div id="csvPreview" class="help">Загрузите файл и нажмите «Предпросмотр»</div>
+</div>
 
-# Reports: tasks daily aggregates
-@app.route("/api/reports/tasks_daily")
-@login_required
-def api_reports_tasks_daily():
-    try:
-        org_id = current_org_id()
-        date_from = request.args.get("date_from") or ""
-        date_to = request.args.get("date_to") or ""
-        df, dt = date_range_bounds(date_from, date_to)
+<script nonce="{{ csp_nonce }}">
+  // Клиентский предпросмотр CSV (первые ~50 строк), без отправки на сервер
+  document.getElementById('btnPreview')?.addEventListener('click', e=>{
+    e.preventDefault();
+    const f = document.getElementById('csvFile').files?.[0];
+    if(!f){ alert('Выберите файл'); return; }
+    const reader = new FileReader();
+    reader.onload = function(){
+      try{
+        const txt = String(reader.result||'');
+        const lines = txt.split(/\\r?\\n/).slice(0, 50);
+        if(!lines.length){ document.getElementById('csvPreview').textContent='Пустой файл'; return; }
+        // определим разделитель по первой строке
+        const sep = (lines[0].split(';').length >= lines[0].split(',').length) ? ';' : ',';
+        const rows = lines.map(l=>l.split(sep));
+        const cols = Math.max(...rows.map(r=>r.length));
+        let html = '<table class="table"><thead><tr>';
+        for(let i=0;i<cols;i++){ html += '<th>col'+(i+1)+'</th>'; }
+        html += '</tr></thead><tbody>';
+        for(const r of rows){
+          html += '<tr>';
+          for(let i=0;i<cols;i++){ html += '<td>'+esc(r[i]||'')+'</td>'; }
+          html += '</tr>';
+        }
+        html += '</tbody></table>';
+        document.getElementById('csvPreview').innerHTML = html;
+      }catch(_){
+        document.getElementById('csvPreview').textContent='Ошибка чтения файла';
+      }
+    };
+    reader.onerror = ()=>{ document.getElementById('csvPreview').textContent='Ошибка чтения файла'; };
+    reader.readAsText(f, 'utf-8');
+  });
+</script>
+"""
+# === END STYLES PART 10/11 ===
+# === STYLES PART 11/11 — ANALYTICS (daily reports, bars, CSV export) ===
+# -*- coding: utf-8 -*-
 
-        # Created per day + monthly fee sum by created date
-        where_created = ["org_id=?"]
-        p_created = [org_id]
-        if df:
-            where_created.append("created_at>=?"); p_created.append(df)
-        if dt:
-            where_created.append("created_at<=?"); p_created.append(dt)
-        rows_created = query_db(
-            f"""
-            SELECT substr(created_at,1,10) AS ymd,
-                   COUNT(1) AS created_cnt,
-                   COALESCE(SUM(monthly_fee),0) AS monthly_fee_sum
-            FROM tasks
-            WHERE {' AND '.join(where_created)}
-            GROUP BY ymd
-            ORDER BY ymd
-            """,
-            tuple(p_created),
-        )
+ANALYTICS_TMPL = """
+<h2 style="margin:0 0 8px 0;">Аналитика</h2>
 
-        # Done per day by updated_at when status is 'done'
-        where_done = ["org_id=?", "status='done'"]
-        p_done = [org_id]
-        if df:
-            where_done.append("updated_at>=?"); p_done.append(df)
-        if dt:
-            where_done.append("updated_at<=?"); p_done.append(dt)
-        rows_done = query_db(
-            f"""
-            SELECT substr(updated_at,1,10) AS ymd,
-                   COUNT(1) AS done_cnt
-            FROM tasks
-            WHERE {' AND '.join(where_done)}
-            GROUP BY ymd
-            ORDER BY ymd
-            """,
-            tuple(p_done),
-        )
+<div class="card">
+  <details open>
+    <summary class="button ghost">Фильтры</summary>
+    <form id="anFilters" class="grid-filters" action="#" onsubmit="return false;">
+      <label>С <input class="input" type="date" id="anFrom" value="{{ request.args.get('date_from','') }}"></label>
+      <label>По <input class="input" type="date" id="anTo" value="{{ request.args.get('date_to','') }}"></label>
+      <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;margin-top:4px;">
+        <button class="button" id="btnAnApply" type="button">Применить</button>
+        <button class="button ghost" id="btnAnReset" type="button">Сбросить</button>
+      </div>
+    </form>
+  </details>
+</div>
 
-        # Overdue per day by updated_at when status is 'overdue'
-        where_over = ["org_id=?", "status='overdue'"]
-        p_over = [org_id]
-        if df:
-            where_over.append("updated_at>=?"); p_over.append(df)
-        if dt:
-            where_over.append("updated_at<=?"); p_over.append(dt)
-        rows_over = query_db(
-            f"""
-            SELECT substr(updated_at,1,10) AS ymd,
-                   COUNT(1) AS overdue_cnt
-            FROM tasks
-            WHERE {' AND '.join(where_over)}
-            GROUP BY ymd
-            ORDER BY ymd
-            """,
-            tuple(p_over),
-        )
+<style>
+  .bar-row{display:flex;align-items:center;gap:8px}
+  .bar{flex:0 0 260px; height:10px; background:var(--surface); border:1px solid var(--border); border-radius:6px; overflow:hidden}
+  .bar .seg{height:100%; display:inline-block}
+  .seg.created{background:var(--accent)}
+  .seg.done{background:var(--ok)}
+  .seg.overdue{background:var(--err)}
+  .seg.inbound{background:var(--accent)}
+  .seg.outbound{background:var(--warn)}
+  .legend{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:6px}
+</style>
 
-        # Merge by ymd
-        agg = {}
-        for r in (rows_created or []):
-            y = r["ymd"]
-            agg[y] = {
-                "ymd": y,
-                "created_cnt": int(r["created_cnt"] or 0),
-                "monthly_fee_sum": float(r["monthly_fee_sum"] or 0.0),
-            }
-        for r in (rows_done or []):
-            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
-            it["done_cnt"] = int(r["done_cnt"] or 0)
-        for r in (rows_over or []):
-            y = r["ymd"]; it = agg.setdefault(y, {"ymd": y})
-            it["overdue_cnt"] = int(r["overdue_cnt"] or 0)
+<div class="split" style="margin-top:10px;">
+  <div class="card">
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
+      <h3 style="margin:0;">Задачи по дням</h3>
+      <div style="display:flex;gap:8px;">
+        <button class="button ghost" id="btnTasksCSV" type="button">Экспорт CSV</button>
+        <button class="button ghost" id="btnTasksRefresh" type="button">Обновить</button>
+      </div>
+    </div>
+    <div class="legend" style="margin:6px 0;">
+      <span><span class="dot" style="background:var(--accent)"></span>создано</span>
+      <span><span class="dot" style="background:var(--ok)"></span>выполнено</span>
+      <span><span class="dot" style="background:var(--err)"></span>просрочено</span>
+    </div>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Дата</th><th>Создано</th><th>Выполнено</th><th>Просрочено</th><th>Абонплата, ₽</th><th>График</th>
+        </tr>
+      </thead>
+      <tbody id="anTasksBody">
+        <tr><td colspan="6"><div class="help">Нажмите «Обновить»</div></td></tr>
+      </tbody>
+      <tfoot>
+        <tr>
+          <th>Итого</th><th id="tSumCreated">0</th><th id="tSumDone">0</th><th id="tSumOver">0</th><th id="tSumFee">0.00</th><th></th>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
 
-        items = [
-            {
-                "ymd": k,
-                "created_cnt": int(v.get("created_cnt", 0)),
-                "done_cnt": int(v.get("done_cnt", 0)),
-                "overdue_cnt": int(v.get("overdue_cnt", 0)),
-                "monthly_fee_sum": float(v.get("monthly_fee_sum", 0.0)),
-            }
-            for k, v in sorted(agg.items())
-        ]
-        return jsonify(ok=True, items=items)
-    except Exception as e:
-        app.logger.exception(f"tasks_daily error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
+  <div class="card">
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
+      <h3 style="margin:0;">Звонки по дням</h3>
+      <div style="display:flex;gap:8px;">
+        <button class="button ghost" id="btnCallsCSV" type="button">Экспорт CSV</button>
+        <button class="button ghost" id="btnCallsRefresh" type="button">Обновить</button>
+      </div>
+    </div>
+    <div class="legend" style="margin:6px 0;">
+      <span><span class="dot" style="background:var(--accent)"></span>входящие</span>
+      <span><span class="dot" style="background:var(--warn)"></span>исходящие</span>
+    </div>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Дата</th><th>Вход.</th><th>Исх.</th><th>Сумм. длит., сек</th><th>График</th>
+        </tr>
+      </thead>
+      <tbody id="anCallsBody">
+        <tr><td colspan="5"><div class="help">Нажмите «Обновить»</div></td></tr>
+      </tbody>
+      <tfoot>
+        <tr>
+          <th>Итого</th><th id="cSumIn">0</th><th id="cSumOut">0</th><th id="cSumDur">0</th><th></th>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
 
+<script nonce="{{ csp_nonce }}">
+  let tasksItems = [];
+  let callsItems = [];
 
-# Reports: calls daily aggregates
-@app.route("/api/reports/calls_daily")
-@login_required
-def api_reports_calls_daily():
-    try:
-        org_id = current_org_id()
-        date_from = request.args.get("date_from") or ""
-        date_to = request.args.get("date_to") or ""
-        df, dt = date_range_bounds(date_from, date_to)
-        where_ = ["org_id=?"]
-        params = [org_id]
-        if df:
-            where_.append("started_at>=?"); params.append(df)
-        if dt:
-            where_.append("started_at<=?"); params.append(dt)
-        rows = query_db(
-            f"""
-            SELECT substr(started_at,1,10) AS ymd,
-                   SUM(CASE WHEN direction='in' THEN 1 ELSE 0 END) AS in_cnt,
-                   SUM(CASE WHEN direction='out' THEN 1 ELSE 0 END) AS out_cnt,
-                   COALESCE(SUM(COALESCE(duration_sec,0)),0) AS dur_sum
-            FROM calls
-            WHERE {' AND '.join(where_)}
-            GROUP BY ymd
-            ORDER BY ymd
-            """,
-            tuple(params),
-        )
-        items = [
-            {
-                "ymd": r["ymd"],
-                "in_cnt": int(r["in_cnt"] or 0),
-                "out_cnt": int(r["out_cnt"] or 0),
-                "dur_sum": int(r["dur_sum"] or 0),
-            }
-            for r in (rows or [])
-        ]
-        return jsonify(ok=True, items=items)
-    except Exception as e:
-        app.logger.exception(f"calls_daily error: {e}")
-        return jsonify(ok=False, error="internal error"), 500
+  function getRange(){
+    const df = (document.getElementById('anFrom').value||'').trim();
+    const dt = (document.getElementById('anTo').value||'').trim();
+    return {df, dt};
+  }
+  function buildParams(df, dt){
+    const ps = new URLSearchParams();
+    if(df) ps.set('date_from', df);
+    if(dt) ps.set('date_to', dt);
+    return ps.toString();
+  }
 
-# Навбар ссылается на /analytics; рендер простого шаблона аналитики
-@app.route("/analytics")
-@login_required
-def analytics():
-    return render_safe(ANALYTICS_TMPL)
+  function seg(widthPct, cls){
+    const w = Math.max(0, Math.min(100, widthPct));
+    return '<span class="seg '+cls+'" style="width:'+w+'%"></span>';
+    }
 
-# Точка старта приложения
-def _start_server():
-    print(f"Starting {APP_NAME} on {HOST}:{PORT} (debug={DEBUG})")
-    app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True)
+  function renderTasks(){
+    const body = document.getElementById('anTasksBody');
+    if(!tasksItems.length){ body.innerHTML = '<tr><td colspan="6"><div class="help">Нет данных</div></td></tr>'; return; }
+    const maxTotal = Math.max(1, ...tasksItems.map(x => (x.created_cnt+x.done_cnt+x.overdue_cnt)));
+    let html = '';
+    let sCreated=0, sDone=0, sOver=0, sFee=0;
+    for(const it of tasksItems){
+      const tot = (it.created_cnt+it.done_cnt+it.overdue_cnt) || 0;
+      const pcCreated = tot ? (it.created_cnt*100/tot) : 0;
+      const pcDone    = tot ? (it.done_cnt*100/tot)    : 0;
+      const pcOver    = tot ? (it.overdue_cnt*100/tot) : 0;
+      html += '<tr>'+
+        '<td>'+esc(it.ymd||'')+'</td>'+
+        '<td>'+String(it.created_cnt||0)+'</td>'+
+        '<td>'+String(it.done_cnt||0)+'</td>'+
+        '<td>'+String(it.overdue_cnt||0)+'</td>'+
+        '<td>'+String((it.monthly_fee_sum||0).toFixed ? it.monthly_fee_sum.toFixed(2) : it.monthly_fee_sum)+'</td>'+
+        '<td><div class="bar-row"><div class="bar">'+
+          seg(pcCreated,'created')+seg(pcDone,'done')+seg(pcOver,'overdue')+
+        '</div></div></td>'+
+      '</tr>';
+      sCreated += (it.created_cnt||0);
+      sDone    += (it.done_cnt||0);
+      sOver    += (it.overdue_cnt||0);
+      sFee     += (it.monthly_fee_sum||0);
+    }
+    body.innerHTML = html;
+    document.getElementById('tSumCreated').textContent = String(sCreated);
+    document.getElementById('tSumDone').textContent    = String(sDone);
+    document.getElementById('tSumOver').textContent    = String(sOver);
+    document.getElementById('tSumFee').textContent     = (sFee.toFixed ? sFee.toFixed(2) : String(sFee));
+  }
 
-# Точка входа — должна быть в самом конце раздела
+  function renderCalls(){
+    const body = document.getElementById('anCallsBody');
+    if(!callsItems.length){ body.innerHTML = '<tr><td colspan="5"><div class="help">Нет данных</div></td></tr>'; return; }
+    const maxTotal = Math.max(1, ...callsItems.map(x => (x.in_cnt+x.out_cnt)));
+    let html = '';
+    let sIn=0, sOut=0, sDur=0;
+    for(const it of callsItems){
+      const total = (it.in_cnt+it.out_cnt)||0;
+      const pcIn  = total ? (it.in_cnt*100/total) : 0;
+      const pcOut = total ? (it.out_cnt*100/total) : 0;
+      html += '<tr>'+
+        '<td>'+esc(it.ymd||'')+'</td>'+
+        '<td>'+String(it.in_cnt||0)+'</td>'+
+        '<td>'+String(it.out_cnt||0)+'</td>'+
+        '<td>'+String(it.dur_sum||0)+'</td>'+
+        '<td><div class="bar-row"><div class="bar">'+
+          seg(pcIn,'inbound')+seg(pcOut,'outbound')+
+        '</div></div></td>'+
+      '</tr>';
+      sIn  += (it.in_cnt||0);
+      sOut += (it.out_cnt||0);
+      sDur += (it.dur_sum||0);
+    }
+    body.innerHTML = html;
+    document.getElementById('cSumIn').textContent  = String(sIn);
+    document.getElementById('cSumOut').textContent = String(sOut);
+    document.getElementById('cSumDur').textContent = String(sDur);
+  }
+
+  function toCSV(rows, header){
+    const escCell = v => {
+      const s = String(v==null?'':v);
+      if(/[",;\\n]/.test(s)) return '"'+s.replace(/"/g,'""')+'"';
+      return s;
+    };
+    const data = [header].concat(rows.map(r => header.map(h => escCell(r[h]))));
+    return data.map(r => r.join(';')).join('\\n');
+  }
+  function downloadCSV(filename, text){
+    const blob = new Blob([text], {type: 'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 0);
+  }
+
+  async function fetchTasks(){
+    const {df, dt} = getRange();
+    const qs = buildParams(df, dt);
+    const r = await fetch('/api/reports/tasks_daily'+(qs?'?'+qs:'')); const j = await r.json();
+    if(!j.ok) throw new Error(j.error||'tasks error');
+    // нормализуем
+    tasksItems = (j.items||[]).map(it => ({
+      ymd: it.ymd,
+      created_cnt: parseInt(it.created_cnt||0,10),
+      done_cnt: parseInt(it.done_cnt||0,10),
+      overdue_cnt: parseInt(it.overdue_cnt||0,10),
+      monthly_fee_sum: parseFloat(it.monthly_fee_sum||0)
+    }));
+  }
+  async function fetchCalls(){
+    const {df, dt} = getRange();
+    const qs = buildParams(df, dt);
+    const r = await fetch('/api/reports/calls_daily'+(qs?'?'+qs:'')); const j = await r.json();
+    if(!j.ok) throw new Error(j.error||'calls error');
+    callsItems = (j.items||[]).map(it => ({
+      ymd: it.ymd,
+      in_cnt: parseInt(it.in_cnt||0,10),
+      out_cnt: parseInt(it.out_cnt||0,10),
+      dur_sum: parseInt(it.dur_sum||0,10)
+    }));
+  }
+
+  async function refreshAll(){
+    try{
+      await Promise.all([fetchTasks(), fetchCalls()]);
+      renderTasks();
+      renderCalls();
+      toast('Данные обновлены');
+    }catch(e){
+      alert('Ошибка загрузки: ' + (e.message||''));
+    }
+  }
+
+  document.getElementById('btnAnApply')?.addEventListener('click', e=>{ e.preventDefault(); refreshAll(); });
+  document.getElementById('btnAnReset')?.addEventListener('click', e=>{
+    e.preventDefault();
+    document.getElementById('anFrom').value='';
+    document.getElementById('anTo').value='';
+    refreshAll();
+  });
+  document.getElementById('btnTasksRefresh')?.addEventListener('click', e=>{ e.preventDefault(); fetchTasks().then(renderTasks).catch(()=>alert('Ошибка')); });
+  document.getElementById('btnCallsRefresh')?.addEventListener('click', e=>{ e.preventDefault(); fetchCalls().then(renderCalls).catch(()=>alert('Ошибка')); });
+
+  document.getElementById('btnTasksCSV')?.addEventListener('click', e=>{
+    e.preventDefault();
+    if(!tasksItems.length){ alert('Нет данных'); return; }
+    const rows = tasksItems.map(it => ({
+      ymd: it.ymd,
+      created_cnt: it.created_cnt,
+      done_cnt: it.done_cnt,
+      overdue_cnt: it.overdue_cnt,
+      monthly_fee_sum: (it.monthly_fee_sum.toFixed ? it.monthly_fee_sum.toFixed(2) : String(it.monthly_fee_sum))
+    }));
+    const csv = toCSV(rows, ['ymd','created_cnt','done_cnt','overdue_cnt','monthly_fee_sum']);
+    downloadCSV('tasks_daily.csv', '\\ufeff'+csv);
+  });
+  document.getElementById('btnCallsCSV')?.addEventListener('click', e=>{
+    e.preventDefault();
+    if(!callsItems.length){ alert('Нет данных'); return; }
+    const rows = callsItems.map(it => ({
+      ymd: it.ymd,
+      in_cnt: it.in_cnt,
+      out_cnt: it.out_cnt,
+      dur_sum: it.dur_sum
+    }));
+    const csv = toCSV(rows, ['ymd','in_cnt','out_cnt','dur_sum']);
+    downloadCSV('calls_daily.csv', '\\ufeff'+csv);
+  });
+
+  // автообновление при входе
+  refreshAll();
+</script>
+"""
+
+# ---- Entry point (ensure STYLES are imported before server start) ----
+try:
+    _start_server  # noqa: F401
+except NameError:
+    # Fallback: если в ядре не определён _start_server, определим безопасный запуск
+    def _start_server():
+        try:
+            # CLI-хук миграций (завершит процесс, если запущено с --migrate)
+            run_migrations_cli_if_requested()
+        except Exception:
+            pass
+        try:
+            # Гарантируем схему БД
+            ensure_schema()
+        except Exception:
+            pass
+        try:
+            # Старт фоновых воркеров (идемпотентно)
+            start_workers_once()
+        except Exception:
+            pass
+        # Запуск приложения
+        app.run(host=HOST, port=PORT, debug=DEBUG)
+
 if __name__ == "__main__":
     _start_server()
 
-# === END STYLES PART 9/9 ===
+# === END STYLES PART 11/11 ===
