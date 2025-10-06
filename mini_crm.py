@@ -3887,7 +3887,7 @@ def bootstrap_once():
     app.config["_BOOTSTRAPPED"] = True
 
 
-@app.before_first_request
+@app.before_request
 def _bootstrap_on_first_request():
     try:
         bootstrap_once()
@@ -6968,7 +6968,7 @@ def api_task_update():
         return jsonify(ok=True)
     except Exception as e:
         app.logger.exception(f"Task update error: {e}")
-        return jsonify(ok(False), error="internal error"), 500  # fallback
+        return jsonify(ok=False, error="internal error"), 500  # fixed
 
 
 @app.route("/api/task/toggle", methods=["POST"])
@@ -9676,9 +9676,11 @@ def start_workers_once():
         app.logger.error(f"Workers start error: {e}")
 
 
-@app.before_first_request
+@app.before_request
 def _ensure_workers_on_first_request():
-    """Ensure workers are started once server is ready to serve requests."""
+    """Ensure workers are started once server is ready to serve requests (Flask 3.1+ compatible)."""
+    if app.config.get("_WORKERS"):
+        return
     try:
         start_workers_once()
     except Exception:
