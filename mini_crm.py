@@ -3301,7 +3301,7 @@ def login():
     totp_token = request.form.get("totp_token", "").strip()
     
     if not username or not password:
-        return render_template_string(LOGIN_TMPL, error="Username and password required")
+        return render_template_string(LOGIN_TMPL, error="Требуются имя пользователя и пароль")
     
     # Find user
     user = query_db(
@@ -3311,7 +3311,7 @@ def login():
     )
     
     if not user or not verify_password(password, user["password_hash"]):
-        return render_template_string(LOGIN_TMPL, error="Invalid credentials")
+        return render_template_string(LOGIN_TMPL, error="Неверные учетные данные")
     
     # Check 2FA if enabled
     if user["totp_enabled"]:
@@ -14426,3 +14426,820 @@ IMPORT_TMPL = LAYOUT_TMPL.replace('{% block content %}', '''{% block content %}
                 <h5 style="margin-top: 12px;">Задачи (tasks):</h5>
                 <pre style="background: var(--panel); padding: 8px; border-radius: 4px; overflow: auto; font-size: 12px;">title;description;assignee_id;due_at;company_id
 Позвонить клиенту;Уточнить детали заказа;2;2024-12-31 15:00;5
+Встретиться с заказчиком;Обсудить техническое задание;3;2024-12-25 10:00;
+</pre>
+                
+                <h5 style="margin-top: 12px;">Сделки (deals):</h5>
+                <pre style="background: var(--panel); padding: 8px; border-radius: 4px; overflow: auto; font-size: 12px;">title;amount;currency;stage;assignee_id;company_id
+Поставка оборудования;500000;RUB;negotiation;2;5
+Консультационные услуги;150000;RUB;proposal;3;
+</pre>
+                
+                <h5 style="margin-top: 12px;">Товары (products):</h5>
+                <pre style="background: var(--panel); padding: 8px; border-radius: 4px; overflow: auto; font-size: 12px;">sku;name;description;price;currency;qty
+SKU-001;Ноутбук HP;Ноутбук HP Pavilion 15;50000;RUB;10
+SKU-002;Монитор Samsung;Монитор 24 дюйма;25000;RUB;5
+</pre>
+            </div>
+        </details>
+        
+        <details style="margin-top: 12px;">
+            <summary class="help" style="cursor: pointer; font-weight: 600;">3. Связи между таблицами</summary>
+            <div style="margin-top: 8px;" class="help">
+                • <strong>company_id</strong> — ID компании (после импорта компаний)<br>
+                • <strong>assignee_id</strong> — ID пользователя (1=admin, 2=второй пользователь...)<br>
+                • <strong>contact_id</strong> — ID контакта (после импорта контактов)<br>
+                • Значения ID можно посмотреть в соответствующих разделах после импорта
+            </div>
+        </details>
+    </div>
+</div>
+
+{% if result %}
+<div class="card" style="margin-top: 16px;">
+    <h3 style="margin: 0 0 8px 0; color: {% if result.success %}var(--success){% else %}var(--error){% endif %};">
+        {% if result.success %}✅ Успешно импортировано{% else %}❌ Ошибка импорта{% endif %}
+    </h3>
+    
+    {% if result.success %}
+        <div class="help">
+            Обработано строк: <strong>{{ result.processed }}</strong><br>
+            Добавлено записей: <strong>{{ result.created }}</strong><br>
+            Обновлено записей: <strong>{{ result.updated }}</strong><br>
+            Пропущено дубликатов: <strong>{{ result.skipped }}</strong>
+        </div>
+    {% endif %}
+    
+    {% if result.errors %}
+        <details style="margin-top: 8px;">
+            <summary style="cursor: pointer; color: var(--error);">Показать ошибки ({{ result.errors|length }})</summary>
+            <pre style="background: var(--panel); padding: 8px; border-radius: 4px; margin-top: 8px; white-space: pre-wrap; font-size: 12px;">{% for error in result.errors %}{{ error }}
+{% endfor %}</pre>
+        </details>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}''').replace('{% endblock %}', '{% endblock %}')
+
+
+# ===== END OF STYLES PART 8/10 =====
+# ═════════════════════════════════════════════════════════════════════════════
+# STYLES PART 9/10 — ADVANCED TEMPLATES: SEARCH, ANALYTICS, SETTINGS, ADMIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ===== TEMPLATE: SEARCH =====
+
+SEARCH_TMPL = LAYOUT_TMPL.replace('{% block content %}', '''{% block content %}
+<h2 style="margin: 0 0 16px 0;">🔍 Поиск</h2>
+
+<div class="card">
+    <form method="get" action="/search" class="form-fixed">
+        <div style="display: flex; gap: 8px;">
+            <input type="text" name="q" value="{{ q }}" placeholder="Поиск по задачам, сообщениям, чатам..." class="input" style="flex: 1;">
+            <button type="submit" class="button" style="min-width: 80px;">Найти</button>
+        </div>
+    </form>
+</div>
+
+{% if q %}
+<div style="margin-top: 16px; display: grid; gap: 16px;">
+    <!-- Inbox Messages Results -->
+    {% if results.inbox %}
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0; color: var(--primary);">📨 Сообщения ({{ results.inbox|length }})</h3>
+        <div style="display: grid; gap: 8px;">
+            {% for msg in results.inbox %}
+            <div style="padding: 8px; background: var(--panel); border-radius: 4px;">
+                <a href="/thread/{{ msg.thread_id }}" style="text-decoration: none; color: inherit;">
+                    <strong>Thread #{{ msg.thread_id }}</strong><br>
+                    <span style="color: var(--text-muted); font-size: 14px;">{{ msg.body[:200] }}...</span>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Tasks Results -->
+    {% if results.tasks %}
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0; color: var(--primary);">✅ Задачи ({{ results.tasks|length }})</h3>
+        <div style="display: grid; gap: 8px;">
+            {% for task in results.tasks %}
+            <div style="padding: 8px; background: var(--panel); border-radius: 4px;">
+                <a href="/task/{{ task.id }}" style="text-decoration: none; color: inherit;">
+                    <strong>{{ task.title }}</strong><br>
+                    <span style="color: var(--text-muted); font-size: 14px;">{{ task.description[:150] }}...</span>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Chat Messages Results -->
+    {% if results.chats %}
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0; color: var(--primary);">💬 Чаты ({{ results.chats|length }})</h3>
+        <div style="display: grid; gap: 8px;">
+            {% for chat in results.chats %}
+            <div style="padding: 8px; background: var(--panel); border-radius: 4px;">
+                <a href="/chat/{{ chat.channel_id }}" style="text-decoration: none; color: inherit;">
+                    <strong>Канал #{{ chat.channel_id }}</strong><br>
+                    <span style="color: var(--text-muted); font-size: 14px;">{{ chat.body[:150] }}...</span>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- No Results -->
+    {% if not results.inbox and not results.tasks and not results.chats %}
+    <div class="card" style="text-align: center; padding: 32px;">
+        <span style="color: var(--text-muted); font-size: 18px;">🔍 Ничего не найдено</span>
+        <p style="margin-top: 8px; color: var(--text-muted);">Попробуйте изменить поисковый запрос или использовать другие ключевые слова.</p>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
+<script nonce="{{ csp_nonce }}">
+// Auto-focus search input
+document.querySelector('input[name="q"]').focus();
+
+// Search suggestions (placeholder for future enhancement)
+function addSearchSuggestions() {
+    // TODO: Add autocomplete suggestions based on recent searches
+    console.log('Search suggestions can be added here');
+}
+</script>
+{% endblock %}''').replace('{% endblock %}', '{% endblock %}')
+
+
+# ===== TEMPLATE: ANALYTICS =====
+
+ANALYTICS_TMPL = LAYOUT_TMPL.replace('{% block content %}', '''{% block content %}
+<h2 style="margin: 0 0 16px 0;">📊 Аналитика</h2>
+
+<div style="display: grid; gap: 16px;">
+    <!-- Date Range Selector -->
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0;">Период анализа</h3>
+        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+            <input type="date" id="dateFrom" class="input" style="width: 150px;">
+            <span style="padding: 8px 0;">—</span>
+            <input type="date" id="dateTo" class="input" style="width: 150px;">
+            <button onclick="loadReports()" class="button">Обновить</button>
+        </div>
+    </div>
+
+    <!-- Quick Stats -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+        <div class="card" style="text-align: center;">
+            <h4 style="margin: 0 0 8px 0; color: var(--success);">✅ Задач выполнено</h4>
+            <div id="statsTasksDone" style="font-size: 24px; font-weight: bold;">-</div>
+        </div>
+        <div class="card" style="text-align: center;">
+            <h4 style="margin: 0 0 8px 0; color: var(--warning);">⏳ Задач в работе</h4>
+            <div id="statsTasksOpen" style="font-size: 24px; font-weight: bold;">-</div>
+        </div>
+        <div class="card" style="text-align: center;">
+            <h4 style="margin: 0 0 8px 0; color: var(--primary);">📞 Звонков</h4>
+            <div id="statsCallsTotal" style="font-size: 24px; font-weight: bold;">-</div>
+        </div>
+        <div class="card" style="text-align: center;">
+            <h4 style="margin: 0 0 8px 0; color: var(--info);">💰 Сумма сделок</h4>
+            <div id="statsDealsAmount" style="font-size: 24px; font-weight: bold;">-</div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div class="card">
+            <h3 style="margin: 0 0 12px 0;">График задач по дням</h3>
+            <canvas id="chartTasks" width="400" height="200"></canvas>
+        </div>
+        <div class="card">
+            <h3 style="margin: 0 0 12px 0;">График звонков по дням</h3>
+            <canvas id="chartCalls" width="400" height="200"></canvas>
+        </div>
+    </div>
+
+    <!-- Detailed Tables -->
+    <div class="card">
+        <h3 style="margin: 0 0 12px 0;">📈 Подробная статистика по дням</h3>
+        <div style="overflow-x: auto;">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Дата</th>
+                        <th>Задач создано</th>
+                        <th>Задач выполнено</th>
+                        <th>Просрочено</th>
+                        <th>Звонков входящих</th>
+                        <th>Звонков исходящих</th>
+                        <th>Общее время разговоров (мин)</th>
+                    </tr>
+                </thead>
+                <tbody id="analyticsTableBody">
+                    <tr><td colspan="7" style="text-align: center; padding: 20px; color: var(--text-muted);">Загрузка данных...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script nonce="{{ csp_nonce }}">
+// Set default date range (last 30 days)
+const today = new Date();
+const month_ago = new Date(today);
+month_ago.setDate(month_ago.getDate() - 30);
+
+document.getElementById('dateFrom').value = month_ago.toISOString().split('T')[0];
+document.getElementById('dateTo').value = today.toISOString().split('T')[0];
+
+// Load reports on page load
+window.addEventListener('load', () => {
+    setTimeout(loadReports, 100);
+});
+
+async function loadReports() {
+    const dateFrom = document.getElementById('dateFrom').value;
+    const dateTo = document.getElementById('dateTo').value;
+    
+    if (!dateFrom || !dateTo) {
+        alert('Выберите период');
+        return;
+    }
+    
+    try {
+        // Load tasks report
+        const tasksResponse = await fetch(`/api/reports/tasks_daily?date_from=${dateFrom}&date_to=${dateTo}`);
+        const tasksData = await tasksResponse.json();
+        
+        // Load calls report
+        const callsResponse = await fetch(`/api/reports/calls_daily?date_from=${dateFrom}&date_to=${dateTo}`);
+        const callsData = await callsResponse.json();
+        
+        renderReports(tasksData.items || [], callsData.items || []);
+    } catch (e) {
+        console.error('Failed to load reports:', e);
+        alert('Ошибка загрузки данных');
+    }
+}
+
+function renderReports(tasksData, callsData) {
+    // Update quick stats
+    let totalTasksDone = 0;
+    let totalTasksOpen = 0;
+    let totalCalls = 0;
+    let totalCallDuration = 0;
+    
+    tasksData.forEach(d => {
+        totalTasksDone += d.done_cnt || 0;
+        totalTasksOpen += d.created_cnt || 0;
+    });
+    
+    callsData.forEach(d => {
+        totalCalls += (d.in_cnt || 0) + (d.out_cnt || 0);
+        totalCallDuration += d.dur_sum || 0;
+    });
+    
+    document.getElementById('statsTasksDone').textContent = totalTasksDone;
+    document.getElementById('statsTasksOpen').textContent = totalTasksOpen;
+    document.getElementById('statsCallsTotal').textContent = totalCalls;
+    document.getElementById('statsDealsAmount').textContent = '₽ N/A'; // Placeholder
+    
+    // Render table
+    const tableBody = document.getElementById('analyticsTableBody');
+    tableBody.innerHTML = '';
+    
+    // Merge data by date
+    const dateMap = {};
+    
+    tasksData.forEach(d => {
+        dateMap[d.ymd] = { ...dateMap[d.ymd], ...d };
+    });
+    
+    callsData.forEach(d => {
+        dateMap[d.ymd] = { ...dateMap[d.ymd], ...d };
+    });
+    
+    const sortedDates = Object.keys(dateMap).sort().reverse();
+    
+    if (sortedDates.length === 0) {
+        tableBody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 20px; color: var(--text-muted);">Нет данных за выбранный период</td></tr>';
+        return;
+    }
+    
+    sortedDates.forEach(date => {
+        const d = dateMap[date];
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td><strong>${date}</strong></td>
+            <td>${d.created_cnt || 0}</td>
+            <td>${d.done_cnt || 0}</td>
+            <td>${d.overdue_cnt || 0}</td>
+            <td>${d.in_cnt || 0}</td>
+            <td>${d.out_cnt || 0}</td>
+            <td>${Math.round((d.dur_sum || 0) / 60)}</td>
+        `;
+        tableBody.appendChild(row);
+    });
+    
+    // Render simple charts (placeholder - in production use Chart.js or similar)
+    renderSimpleChart('chartTasks', tasksData, ['done_cnt', 'created_cnt'], ['#28a745', '#007bff']);
+    renderSimpleChart('chartCalls', callsData, ['in_cnt', 'out_cnt'], ['#17a2b8', '#ffc107']);
+}
+
+function renderSimpleChart(canvasId, data, fields, colors) {
+    const canvas = document.getElementById(canvasId);
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    // Clear canvas
+    ctx.clearRect(0, 0, width, height);
+    
+    if (data.length === 0) {
+        ctx.fillStyle = '#999';
+        ctx.font = '14px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Нет данных', width / 2, height / 2);
+        return;
+    }
+    
+    // Simple bar chart
+    const barWidth = width / data.length * 0.8;
+    const maxVal = Math.max(...data.flatMap(d => fields.map(f => d[f] || 0))) || 1;
+    
+    data.forEach((d, i) => {
+        fields.forEach((field, j) => {
+            const value = d[field] || 0;
+            const barHeight = (value / maxVal) * (height - 40);
+            const x = i * (width / data.length) + j * (barWidth / fields.length);
+            const y = height - barHeight - 20;
+            
+            ctx.fillStyle = colors[j] || '#007bff';
+            ctx.fillRect(x, y, barWidth / fields.length - 2, barHeight);
+        });
+    });
+    
+    // Simple legend
+    ctx.font = '12px Arial';
+    fields.forEach((field, i) => {
+        ctx.fillStyle = colors[i] || '#007bff';
+        ctx.fillRect(10, 10 + i * 20, 10, 10);
+        ctx.fillStyle = '#333';
+        ctx.fillText(field, 25, 20 + i * 20);
+    });
+}
+</script>
+{% endblock %}''').replace('{% endblock %}', '{% endblock %}')
+
+
+# ===== TEMPLATE: SETTINGS =====
+
+SETTINGS_TMPL = LAYOUT_TMPL.replace('{% block content %}', '''{% block content %}
+<h2 style="margin: 0 0 16px 0;">⚙️ Настройки</h2>
+
+<div style="display: grid; gap: 16px;">
+    
+    <!-- Channels Configuration -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">📡 Каналы связи</h3>
+        
+        <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 8px 0;">Добавить канал</h4>
+            <form method="post" action="/settings/channel/add" class="form-fixed">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 8px; align-items: end;">
+                    <div>
+                        <label>Тип</label>
+                        <select name="type" class="select" required>
+                            <option value="">— выберите —</option>
+                            <option value="email">Email</option>
+                            <option value="phone">Телефония</option>
+                            <option value="telegram">Telegram</option>
+                            <option value="whatsapp">WhatsApp</option>
+                            <option value="api">API</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>Название</label>
+                        <input type="text" name="name" class="input" required placeholder="Например: Основной email">
+                    </div>
+                    <div>
+                        <label>‌</label>
+                        <button type="submit" class="button">Добавить</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        
+        {% if channels %}
+        <div style="overflow-x: auto;">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Тип</th>
+                        <th>Название</th>
+                        <th>Статус</th>
+                        <th>Создан</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for ch in channels %}
+                    <tr>
+                        <td><code>{{ ch.id }}</code></td>
+                        <td>
+                            <span class="badge" style="background: 
+                                {%- if ch.type == 'email' -%}#28a745
+                                {%- elif ch.type == 'phone' -%}#007bff
+                                {%- elif ch.type == 'telegram' -%}#17a2b8
+                                {%- else -%}#6c757d{%- endif -%};">
+                                {{ ch.type }}
+                            </span>
+                        </td>
+                        <td><strong>{{ ch.name }}</strong></td>
+                        <td>
+                            <span class="badge" style="background: {% if ch.active %}#28a745{% else %}#dc3545{% endif %};">
+                                {% if ch.active %}Активен{% else %}Отключен{% endif %}
+                            </span>
+                        </td>
+                        <td style="font-size: 13px; color: var(--text-muted);">{{ ch.created_at[:10] }}</td>
+                        <td>
+                            <form method="post" action="/settings/channel/toggle/{{ ch.id }}" style="display: inline;">
+                                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                                <button type="submit" class="button button-sm" 
+                                        style="background: {% if ch.active %}#dc3545{% else %}#28a745{% endif %};">
+                                    {% if ch.active %}Отключить{% else %}Включить{% endif %}
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="color: var(--text-muted); text-align: center; padding: 20px;">Каналы не настроены</p>
+        {% endif %}
+    </div>
+
+    <!-- Webhooks Configuration -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">🔗 Веб-хуки</h3>
+        
+        <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 8px 0;">Добавить веб-хук</h4>
+            <form method="post" action="/settings/webhook/add" class="form-fixed">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                <div style="display: grid; grid-template-columns: 150px 1fr 150px auto; gap: 8px; align-items: end;">
+                    <div>
+                        <label>Событие</label>
+                        <select name="event" class="select" required>
+                            <option value="task.created">task.created</option>
+                            <option value="task.completed">task.completed</option>
+                            <option value="deal.created">deal.created</option>
+                            <option value="call.incoming">call.incoming</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>URL</label>
+                        <input type="url" name="url" class="input" required placeholder="https://example.com/webhook">
+                    </div>
+                    <div>
+                        <label>Секрет (опционально)</label>
+                        <input type="text" name="secret" class="input" placeholder="secret_key">
+                    </div>
+                    <div>
+                        <label>‌</label>
+                        <button type="submit" class="button">Добавить</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        
+        {% if webhooks %}
+        <div style="overflow-x: auto;">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Событие</th>
+                        <th>URL</th>
+                        <th>Статус</th>
+                        <th>Создан</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for wh in webhooks %}
+                    <tr>
+                        <td><code>{{ wh.event }}</code></td>
+                        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
+                            <a href="{{ wh.url }}" target="_blank" style="color: var(--primary);">{{ wh.url }}</a>
+                        </td>
+                        <td>
+                            <span class="badge" style="background: {% if wh.active %}#28a745{% else %}#dc3545{% endif %};">
+                                {% if wh.active %}Активен{% else %}Отключен{% endif %}
+                            </span>
+                        </td>
+                        <td style="font-size: 13px; color: var(--text-muted);">{{ wh.created_at[:10] }}</td>
+                        <td>
+                            <form method="post" action="/settings/webhook/test/{{ wh.id }}" style="display: inline;">
+                                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                                <button type="submit" class="button button-sm" style="background: #007bff;">Тест</button>
+                            </form>
+                            <form method="post" action="/settings/webhook/delete/{{ wh.id }}" style="display: inline;">
+                                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                                <button type="submit" class="button button-sm" style="background: #dc3545;" onclick="return confirm('Удалить?')">Удалить</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p style="color: var(--text-muted); text-align: center; padding: 20px;">Веб-хуки не настроены</p>
+        {% endif %}
+    </div>
+
+    <!-- User Management -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">👥 Управление пользователями</h3>
+        
+        <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 8px 0;">Добавить пользователя</h4>
+            <form method="post" action="/settings/user/add" class="form-fixed">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 150px auto; gap: 8px; align-items: end;">
+                    <div>
+                        <label>Имя пользователя</label>
+                        <input type="text" name="username" class="input" required>
+                    </div>
+                    <div>
+                        <label>Email</label>
+                        <input type="email" name="email" class="input">
+                    </div>
+                    <div>
+                        <label>Пароль (мин. 12 символов)</label>
+                        <input type="password" name="password" class="input" required>
+                    </div>
+                    <div>
+                        <label>Роль</label>
+                        <select name="role" class="select">
+                            <option value="agent">Agent</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>‌</label>
+                        <button type="submit" class="button">Добавить</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        
+        {% if users %}
+        <div style="overflow-x: auto;">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Пользователь</th>
+                        <th>Email</th>
+                        <th>Роль</th>
+                        <th>Статус</th>
+                        <th>Последний вход</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for u in users %}
+                    <tr>
+                        <td><strong>{{ u.username }}</strong></td>
+                        <td>{{ u.email or '—' }}</td>
+                        <td>
+                            <span class="badge" style="background: {% if u.role == 'admin' %}#dc3545{% else %}#28a745{% endif %};">
+                                {{ u.role }}
+                            </span>
+                        </td>
+                        <td>
+                            <span class="badge" style="background: {% if u.active %}#28a745{% else %}#6c757d{% endif %};">
+                                {% if u.active %}Активен{% else %}Отключен{% endif %}
+                            </span>
+                        </td>
+                        <td style="font-size: 13px; color: var(--text-muted);">
+                            {{ u.last_login_at[:16] if u.last_login_at else '—' }}
+                        </td>
+                        <td>
+                            {% if u.id != user.id %}
+                            <form method="post" action="/settings/user/toggle/{{ u.id }}" style="display: inline;">
+                                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                                <button type="submit" class="button button-sm" 
+                                        style="background: {% if u.active %}#dc3545{% else %}#28a745{% endif %};">
+                                    {% if u.active %}Отключить{% else %}Включить{% endif %}
+                                </button>
+                            </form>
+                            {% else %}
+                            <span style="color: var(--text-muted); font-size: 13px;">Это вы</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Task Statuses Management -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">📝 Статусы задач</h3>
+        
+        <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 8px 0;">Добавить статус</h4>
+            <form method="post" action="/settings/task_status/add" class="form-fixed">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                <div style="display: flex; gap: 8px; align-items: end;">
+                    <div style="flex: 1;">
+                        <label>Название статуса</label>
+                        <input type="text" name="name" class="input" required placeholder="В работе, Ожидание, etc.">
+                    </div>
+                    <button type="submit" class="button">Добавить</button>
+                </div>
+            </form>
+        </div>
+        
+        {% if task_statuses %}
+        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            {% for ts in task_statuses %}
+            <div style="display: flex; align-items: center; background: var(--panel); padding: 8px 12px; border-radius: 4px;">
+                <span><strong>{{ ts.name }}</strong></span>
+                <form method="post" action="/settings/task_status/delete/{{ ts.id }}" style="margin-left: 8px;">
+                    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                    <button type="submit" class="button button-sm" style="background: #dc3545; padding: 2px 6px; font-size: 12px;" onclick="return confirm('Удалить статус?')">×</button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Department Management -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">🏢 Отделы</h3>
+        
+        <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 8px 0;">Добавить отдел</h4>
+            <form method="post" action="/settings/department/add" class="form-fixed">
+                <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+                <div style="display: flex; gap: 8px; align-items: end;">
+                    <div style="flex: 1;">
+                        <label>Название отдела</label>
+                        <input type="text" name="name" class="input" required placeholder="Продажи, Поддержка, Разработка">
+                    </div>
+                    <button type="submit" class="button">Добавить</button>
+                </div>
+            </form>
+        </div>
+        
+        {% if departments %}
+        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+            {% for dept in departments %}
+            <div style="background: var(--panel); padding: 8px 16px; border-radius: 4px; border-left: 4px solid var(--primary);">
+                <strong>{{ dept.name }}</strong>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    Slug: {{ dept.slug }}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- System Information -->
+    <div class="card">
+        <h3 style="margin: 0 0 16px 0;">🖥️ Информация о системе</h3>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+            <div>
+                <strong>Версия схемы БД:</strong><br>
+                <code style="background: var(--panel); padding: 4px 8px; border-radius: 4px;">v{{ query_db('PRAGMA user_version', one=True)[0] }}</code>
+            </div>
+            <div>
+                <strong>Общих записей:</strong><br>
+                <span style="font-size: 18px;">{{ query_db('SELECT COUNT(*) as cnt FROM tasks WHERE org_id=?', (user.org_id,), one=True)['cnt'] }}</span> задач
+            </div>
+            <div>
+                <strong>Активных пользователей:</strong><br>
+                <span style="font-size: 18px;">{{ query_db('SELECT COUNT(*) as cnt FROM users WHERE org_id=? AND active=1', (user.org_id,), one=True)['cnt'] }}</span>
+            </div>
+            <div>
+                <strong>Размер базы данных:</strong><br>
+                <span id="dbSize">Вычисляется...</span>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script nonce="{{ csp_nonce }}">
+// Get DB size
+fetch('/api/admin/db_stats')
+    .then(r => r.json())
+    .then(data => {
+        if (data.ok) {
+            const size = Math.round(data.size_bytes / 1024 / 1024 * 100) / 100;
+            document.getElementById('dbSize').textContent = size + ' MB';
+        }
+    })
+    .catch(() => {
+        document.getElementById('dbSize').textContent = 'Н/Д';
+    });
+</script>
+{% endblock %}''').replace('{% endblock %}', '{% endblock %}')
+
+
+# ===== END OF STYLES PART 9/10 =====
+# ═════════════════════════════════════════════════════════════════════════════
+# STYLES PART 10/10 — FINAL: STARTUP CODE & MAIN EXECUTION =====
+
+# ===== BLOCK: MAIN EXECUTION STARTUP =====
+
+def main():
+    """Main application entry point"""
+    # Check for CLI migration mode
+    run_migrations_cli_if_requested()
+    
+    # Initialize database
+    with app.app_context():
+        ensure_schema()
+        seed_defaults()
+    
+    log("INFO", f"Starting CRM server on {HOST}:{PORT}")
+    log("INFO", f"Environment: {ENV} (DEBUG={DEBUG})")
+    log("INFO", f"Database: {DATABASE_PATH}")
+    log("INFO", f"Storage backend: {STORAGE_BACKEND}")
+    
+    if AI_API_KEY:
+        log("INFO", f"AI provider: {AI_PROVIDER} ({AI_MODEL})")
+    else:
+        log("WARN", "AI provider not configured (AI_API_KEY missing)")
+    
+    if REDIS_AVAILABLE and get_redis():
+        log("INFO", "Redis connection successful")
+    else:
+        log("WARN", "Redis not available - using in-memory fallbacks")
+    
+    if SMTP_HOST:
+        log("INFO", f"SMTP configured: {SMTP_HOST}:{SMTP_PORT}")
+    else:
+        log("WARN", "SMTP not configured - email disabled")
+    
+    # Start Flask application
+    try:
+        app.run(
+            host=HOST,
+            port=PORT,
+            debug=DEBUG,
+            threaded=True,
+            use_reloader=False  # Disable auto-reload in production
+        )
+    except KeyboardInterrupt:
+        log("INFO", "Server shutdown requested")
+    except Exception as e:
+        log("ERROR", f"Server startup failed: {e}")
+        sys.exit(1)
+
+
+# ===== BLOCK: PRODUCTION WSGI ENTRY POINT =====
+
+def create_app():
+    """
+    Factory function for WSGI deployment.
+    Usage with Gunicorn: gunicorn -w 4 mini_crm:create_app()
+    """
+    with app.app_context():
+        ensure_schema()
+        seed_defaults()
+    
+    return app
+
+
+# ===== BLOCK: FINAL STARTUP =====
+
+if __name__ == "__main__":
+    main()
+
+
+# ===== END OF ENTERPRISE CRM SYSTEM =====
+# Total Lines of Code: ~15,000+
+# Features: Tasks, Deals, Companies, Contacts, Inbox, AI Integration, 2FA, etc.
+# Architecture: Monolithic Flask + SQLite (production-ready with proper migrations)
+# Security: CSRF, Rate Limiting, Input Validation, File Upload Security
+# AI-Ready: OpenAI/Anthropic integration, embeddings support, agent actions audit
+# ═══════════════════════════════════════════════════════════════════════════════
