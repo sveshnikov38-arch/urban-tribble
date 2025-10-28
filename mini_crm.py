@@ -1,6 +1,3 @@
-# ===== START OF CORE PART 1/10 =====
-# coding: utf-8
-
 # ==================== CORE PART 1/10 ====================
 # ===== BLOCK: IMPORTS & CONFIGURATION =====
 import os
@@ -32,7 +29,7 @@ from flask import (
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
-# Optional deps (feature-gated)
+# ----- Optional deps (feature-gated) -----
 try:
     import requests as _rq  # HTTP client
 except Exception:
@@ -73,10 +70,10 @@ except Exception:
     EmailNotValidError = Exception  # type: ignore
     EMAIL_VALIDATOR_AVAILABLE = False
 
-# Compatibility: app/module name
+# ----- Compatibility: app/module name -----
 APP_NAME = __name__
 
-# Environment & App config
+# ----- Environment & App config -----
 ENV = os.getenv("ENV", "development").lower()
 DEBUG = ENV == "development"
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -85,19 +82,19 @@ PORT = int(os.getenv("PORT", "5000"))
 SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_hex(32)
 VERSION = "5.2.0"
 
-# Storage
+# ----- Storage -----
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")  # local|s3
 LOCAL_UPLOAD_DIR = os.getenv("LOCAL_UPLOAD_DIR", "./uploads")
 
-# Redis
+# ----- Redis -----
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_REQUIRED = os.getenv("REDIS_REQUIRED", "false").lower() == "true"
 
-# Cache
+# ----- Cache -----
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 CACHE_DEFAULT_TTL = int(os.getenv("CACHE_DEFAULT_TTL", "60"))
 
-# AI
+# ----- AI -----
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
@@ -110,14 +107,14 @@ AI_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("AI_CIRCUIT_BREAKER_TIMEOUT", "60"))
 AI_STREAMING_ENABLED = os.getenv("AI_STREAMING_ENABLED", "true").lower() == "true"
 AI_SYNC_MODE = os.getenv("AI_SYNC_MODE", "false").lower() == "true"
 
-# SSE / Collaboration
+# ----- SSE / Collaboration -----
 SSE_ENABLED = os.getenv("SSE_ENABLED", "true").lower() == "true"
 SSE_MAX_CONN_PER_USER = int(os.getenv("SSE_MAX_CONN_PER_USER", "3"))
 WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "false").lower() == "true"
 COLLABORATION_TIMEOUT = int(os.getenv("COLLABORATION_TIMEOUT", "300"))
 SSE_BACKPLANE = os.getenv("SSE_BACKPLANE", "memory").lower()  # memory|redis
 
-# CSP / security / proxy
+# ----- CSP / security / proxy -----
 CSP_ENABLED = os.getenv("CSP_ENABLED", "true").lower() == "true"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FORMAT = os.getenv("LOG_FORMAT", "json")  # json|text
@@ -127,7 +124,7 @@ HSTS_MAX_AGE = int(os.getenv("HSTS_MAX_AGE", str(31536000)))
 HSTS_INCLUDE_SUBDOMAINS = os.getenv("HSTS_INCLUDE_SUBDOMAINS", "true").lower() == "true"
 HSTS_PRELOAD = os.getenv("HSTS_PRELOAD", "false").lower() == "true"
 
-# Feature toggles
+# ----- Feature toggles -----
 ZERO_CODE_AGENT_BUILDER_ENABLED = os.getenv("ZERO_CODE_AGENT_BUILDER_ENABLED", "true").lower() == "true"
 LIVE_COLLAB_ENABLED = os.getenv("LIVE_COLLAB_ENABLED", "true").lower() == "true"
 NOTIFICATION_CENTER_ENABLED = os.getenv("NOTIFICATION_CENTER_ENABLED", "true").lower() == "true"
@@ -136,11 +133,11 @@ AUTONOMOUS_SALES_MODE_ENABLED = os.getenv("AUTONOMOUS_SALES_MODE_ENABLED", "fals
 DIGITAL_TWIN_DECISION_CENTER_ENABLED = os.getenv("DIGITAL_TWIN_DECISION_CENTER_ENABLED", "true").lower() == "true"
 PAYROLL_ENABLED = os.getenv("PAYROLL_ENABLED", "true").lower() == "true"
 
-# Observability
+# ----- Observability -----
 OTEL_ENABLED = os.getenv("OTEL_ENABLED", "false").lower() == "true"
 SENTRY_DSN = os.getenv("SENTRY_DSN", "")
 
-# Rate limiting
+# ----- Rate limiting -----
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 GLOBAL_RATE_LIMIT_PER_MIN = int(os.getenv("GLOBAL_RATE_LIMIT_PER_MIN", "900"))
 LOGIN_RATE_LIMIT_PER_MIN = int(os.getenv("LOGIN_RATE_LIMIT_PER_MIN", "20"))
@@ -148,12 +145,11 @@ APPROVAL_RATE_LIMIT_PER_MIN = int(os.getenv("APPROVAL_RATE_LIMIT_PER_MIN", "60")
 RATE_LIMIT_MAX_KEYS = int(os.getenv("RATE_LIMIT_MAX_KEYS", "20000"))
 RATE_LIMIT_CLEANUP_EVERY_SEC = int(os.getenv("RATE_LIMIT_CLEANUP_EVERY_SEC", "60"))
 
-# Misc
+# ----- Misc -----
 JITSI_BASE = os.getenv("JITSI_BASE", "https://meet.jit.si")
 
-# Security extras
+# ----- Security extras -----
 ADMIN_2FA_BYPASS = os.getenv("ADMIN_2FA_BYPASS", "false").lower() == "true"
-
 
 # ===== BLOCK: LOGGING & UTILITIES =====
 class JSONFormatter(logging.Formatter):
@@ -174,7 +170,6 @@ class JSONFormatter(logging.Formatter):
         except Exception:
             return super().format(record)
 
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(message)s" if LOG_FORMAT == "json" else "%(asctime)s [%(levelname)s] %(message)s",
@@ -185,7 +180,6 @@ if LOG_FORMAT == "json":
         _h.setFormatter(JSONFormatter())
 
 logger = logging.getLogger("crm")
-
 
 def log(level: str, message: str, **kwargs):
     # Redact sensitive fields
@@ -210,10 +204,8 @@ def log(level: str, message: str, **kwargs):
     else:
         fn(f"{message} | {safe_kwargs}")
 
-
 def utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
 
 def ensure_iso_datetime(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -233,7 +225,6 @@ def ensure_iso_datetime(s: Optional[str]) -> Optional[str]:
     except Exception:
         return t
 
-
 def normalize_phone(phone: Optional[str]) -> str:
     if not phone:
         return ""
@@ -246,7 +237,6 @@ def normalize_phone(phone: Optional[str]) -> str:
         return "+" + digits
     return phone or ""
 
-
 def validate_email(val: Optional[str]) -> bool:
     if not val:
         return False
@@ -256,17 +246,14 @@ def validate_email(val: Optional[str]) -> bool:
             return True
         except EmailNotValidError:
             return False
-    # Regex fallback (RFC-like, упрощённый)
-    return bool(re.fullmatch(r"^[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$", val or ""))
-
+    # Regex fallback (RFC-like, упрощённый) — экранируем точку
+    return bool(re.fullmatch(r"^[A-Za-z0-9.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$", val or ""))
 
 def generate_random_code(length: int = 6, charset: str = "0123456789") -> str:
     return "".join(secrets.choice(charset) for _ in range(length))
 
-
 def generate_request_id() -> str:
     return uuid.uuid4().hex[:16]
-
 
 def get_client_ip() -> str:
     try:
@@ -276,13 +263,11 @@ def get_client_ip() -> str:
     except Exception:
         return "0.0.0.0"
 
-
 def secure_equal(a: str, b: str) -> bool:
     try:
         return hmac.compare_digest(a, b)
     except Exception:
         return a == b
-
 
 class TTLCache:
     """Simple in-memory TTL cache (thread-safe), used as L1 fallback."""
@@ -321,11 +306,9 @@ class TTLCache:
                 if exp < now:
                     self._store.pop(k, None)
 
-
 _global_cache = TTLCache()
 
-
-# Password policy
+# ----- Password policy -----
 def validate_password_strength(password: str) -> Tuple[bool, str]:
     pw = password or ""
     if len(pw) < 8:
@@ -336,11 +319,9 @@ def validate_password_strength(password: str) -> Tuple[bool, str]:
         return False, "Пароль должен содержать хотя бы одну строчную букву"
     if not re.search(r"[0-9]", pw):
         return False, "Пароль должен содержать хотя бы одну цифру"
-    # Исправлено: корректный класс спецсимволов
     if not re.search(r'[!@#$%^&*(),.?":{}|<>]', pw):
         return False, "Пароль должен содержать хотя бы один спецсимвол"
     return True, ""
-
 
 # ===== BLOCK: METRICS & OBSERVABILITY =====
 _metrics_lock = threading.Lock()
@@ -367,7 +348,7 @@ def _increment_metric(key: str, labels: Optional[dict] = None, value: int = 1):
         else:
             _metrics[key] = _metrics.get(key, 0) + value
 
-# OpenTelemetry tracer (lazy init)
+# ----- OpenTelemetry tracer (lazy init) -----
 _tracer = None
 def get_tracer():
     global _tracer
@@ -378,11 +359,9 @@ def get_tracer():
             _tracer = None
     return _tracer
 
-
 # ===== BLOCK: REDIS, CACHE & SSE =====
 _redis_client = None
 _redis_lock = threading.Lock()
-
 
 class RedisCircuitBreaker:
     def __init__(self, failure_threshold: int = 5, timeout: int = 60):
@@ -417,9 +396,7 @@ class RedisCircuitBreaker:
                     log("ERROR", "Redis circuit opened", failures=self.failure_count)
             raise e
 
-
 _redis_cb = RedisCircuitBreaker(failure_threshold=5, timeout=60)
-
 
 def get_redis():
     global _redis_client
@@ -440,7 +417,6 @@ def get_redis():
                 return None
     return _redis_client
 
-
 def redis_get(key: str) -> Optional[str]:
     r = get_redis()
     if not r:
@@ -449,7 +425,6 @@ def redis_get(key: str) -> Optional[str]:
         return _redis_cb.call(r.get, key)
     except Exception:
         return None
-
 
 def redis_setex(key: str, ttl: int, value: str) -> bool:
     r = get_redis()
@@ -461,12 +436,10 @@ def redis_setex(key: str, ttl: int, value: str) -> bool:
     except Exception:
         return False
 
-
-# Rate limiting (IP or user-based)
+# ===== Rate limiting (IP or user-based) =====
 _rate_lock = threading.Lock()
 _rate_buckets: Dict[str, List[float]] = {}
 _rate_last_cleanup = 0.0
-
 
 def rate_limit_allow(key: str, per_min: int) -> bool:
     if not RATE_LIMIT_ENABLED or per_min <= 0:
@@ -504,7 +477,6 @@ def rate_limit_allow(key: str, per_min: int) -> bool:
         _rate_buckets[key] = lst
         return True
 
-
 def _rate_limit(prefix: str, per_min: int):
     def deco(f):
         @wraps(f)
@@ -518,7 +490,6 @@ def _rate_limit(prefix: str, per_min: int):
         return wrapped
     return deco
 
-
 def _rate_limit_ip(prefix: str, per_min: int):
     def deco(f):
         @wraps(f)
@@ -531,13 +502,23 @@ def _rate_limit_ip(prefix: str, per_min: int):
         return wrapped
     return deco
 
+def _ratelimit_housekeeping():
+    """Housekeeping для in-memory rate limit buckets (вызывается воркером)."""
+    now = time.time()
+    stale_before = now - 180
+    with _rate_lock:
+        for k, lst in list(_rate_buckets.items()):
+            nlst = [t for t in lst if t >= stale_before]
+            if nlst:
+                _rate_buckets[k] = nlst[-100:]
+            else:
+                _rate_buckets.pop(k, None)
 
-# SSE backplane
+# ===== SSE backplane =====
 _sse_lock = threading.Lock()
 _sse_queues: Dict[int, List[Queue]] = {}
 _sse_pubsub_thread: Optional[threading.Thread] = None
 _sse_stop_event = threading.Event()
-
 
 def _sse_publish_redis(user_id: int, event: str, data: dict):
     r = get_redis()
@@ -548,7 +529,6 @@ def _sse_publish_redis(user_id: int, event: str, data: dict):
         _redis_cb.call(r.publish, "sse:events", payload)
     except Exception as e:
         log("WARN", "SSE publish failed", error=str(e))
-
 
 def _sse_subscriber_loop():
     r = get_redis()
@@ -590,7 +570,6 @@ def _sse_subscriber_loop():
     except Exception as e:
         log("WARN", "SSE subscriber error", error=str(e))
 
-
 def sse_backplane_start():
     global _sse_pubsub_thread
     if SSE_BACKPLANE == "redis" and REDIS_AVAILABLE and _sse_pubsub_thread is None:
@@ -600,7 +579,6 @@ def sse_backplane_start():
             log("INFO", "SSE Redis backplane started")
         except Exception as e:
             log("WARN", "SSE backplane start failed", error=str(e))
-
 
 def sse_push(user_id: int, event: str, data: dict):
     if not SSE_ENABLED:
@@ -629,7 +607,6 @@ def sse_push(user_id: int, event: str, data: dict):
     if SSE_BACKPLANE == "redis" and REDIS_AVAILABLE:
         _sse_publish_redis(uid, event, data)
 
-
 # ===== BLOCK: FLASK INIT & MIDDLEWARE =====
 app = Flask(APP_NAME)
 app.secret_key = SECRET_KEY
@@ -655,7 +632,7 @@ if not hasattr(app, "before_first_request"):
     app.before_first_request = _before_first_request_shim  # type: ignore
 # ---- end of compatibility shim ----
 
-# Session / Cookies
+# ----- Session / Cookies -----
 if ENV == "production":
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -671,7 +648,7 @@ else:
         TESTING=False,
     )
 
-# Proxy
+# ----- Proxy -----
 if PROXY_TRUSTED_COUNT > 0:
     app.wsgi_app = ProxyFix(  # type: ignore
         app.wsgi_app,
@@ -682,7 +659,7 @@ if PROXY_TRUSTED_COUNT > 0:
         x_prefix=0,
     )
 
-# Sentry
+# ----- Sentry -----
 if SENTRY_DSN and SENTRY_SDK_AVAILABLE and sentry_sdk and FlaskIntegration:
     try:
         sentry_sdk.init(
@@ -696,7 +673,7 @@ if SENTRY_DSN and SENTRY_SDK_AVAILABLE and sentry_sdk and FlaskIntegration:
     except Exception as e:
         log("WARN", "Sentry init failed", error=str(e))
 
-# OTEL
+# ----- OTEL -----
 if OTEL_ENABLED and OTEL_AVAILABLE and FlaskInstrumentor and RequestsInstrumentor:
     try:
         FlaskInstrumentor().instrument_app(app)  # type: ignore
@@ -705,8 +682,7 @@ if OTEL_ENABLED and OTEL_AVAILABLE and FlaskInstrumentor and RequestsInstrumento
     except Exception as e:
         log("WARN", "OpenTelemetry init failed", error=str(e))
 
-
-# Request Timeout middleware
+# ----- Request Timeout middleware -----
 class TimeoutMiddleware:
     def __init__(self, wsgi_app, timeout=30):
         self.app = wsgi_app
@@ -746,11 +722,9 @@ class TimeoutMiddleware:
         else:
             return self.app(environ, start_response)
 
-
 app.wsgi_app = TimeoutMiddleware(app.wsgi_app, timeout=int(os.getenv("REQUEST_TIMEOUT", "30")))
 
-
-# CSP builder
+# ----- CSP builder -----
 def build_csp(nonce: str) -> str:
     if not CSP_ENABLED:
         return ""
@@ -777,7 +751,6 @@ def build_csp(nonce: str) -> str:
         "frame-ancestors 'self'; "
         "form-action 'self'"
     )
-
 
 @app.before_request
 def _before_request():
@@ -816,7 +789,6 @@ def _before_request():
     except Exception:
         pass
 
-
 @app.after_request
 def _after_request(resp: Response):
     try:
@@ -845,7 +817,6 @@ def _after_request(resp: Response):
         log("WARN", "after_request failure", error=str(e))
     return resp
 
-
 @app.errorhandler(500)
 def _handle_500(e):
     _increment_metric("errors_total")
@@ -854,8 +825,7 @@ def _handle_500(e):
         return jsonify(ok=False, error="Internal Server Error"), 500
     return Response("Internal Server Error", 500)
 
-
-# Graceful shutdown
+# ===== Graceful shutdown =====
 _shutdown_event = threading.Event()
 def _signal_handler(signum, frame):
     log("INFO", "Shutdown signal received", signal=signum)
@@ -867,11 +837,10 @@ def _signal_handler(signum, frame):
 
 try:
     signal.signal(signal.SIGTERM, _signal_handler)  # type: ignore
-    signal.signal(signal.SIGINT, _signal_handler)   # type: ignore
+    signal.signal(signal.SIGINT, _signal_handler)  # type: ignore
 except Exception:
     # not supported on some platforms (e.g., Windows in certain contexts)
     pass
-
 
 # ===== BLOCK: AUTH & SESSION =====
 def _get_current_user() -> Optional[dict]:
@@ -890,7 +859,6 @@ def _get_current_user() -> Optional[dict]:
         "username": session.get("username", "user")
     }
 
-
 def _login_required(f):
     @wraps(f)
     def _wrap(*args, **kwargs):
@@ -903,7 +871,6 @@ def _login_required(f):
         return f(*args, **kwargs)
     return _wrap
 
-
 def _auth_or_token(f):
     @wraps(f)
     def _wrap(*args, **kwargs):
@@ -914,7 +881,6 @@ def _auth_or_token(f):
         g.user = user
         return f(*args, **kwargs)
     return _wrap
-
 
 def _require_role(role: str):
     def deco(f):
@@ -929,7 +895,6 @@ def _require_role(role: str):
             return f(*args, **kwargs)
         return _wrap
     return deco
-
 
 def _require_scopes(required: Set[str]):
     def deco(f):
@@ -946,7 +911,6 @@ def _require_scopes(required: Set[str]):
         return _wrap
     return deco
 
-
 def _csrf_protect(f):
     @wraps(f)
     def _wrap(*args, **kwargs):
@@ -958,8 +922,7 @@ def _csrf_protect(f):
         return f(*args, **kwargs)
     return _wrap
 
-
-# Session invalidation (optional Redis-backed)
+# ----- Session invalidation (optional Redis-backed) -----
 def invalidate_user_sessions(user_id: int, exclude_session_id: Optional[str] = None):
     """
     Strategy for cookie-based sessions: set a revocation timestamp per user and enforce it in before_request (DB override).
@@ -975,14 +938,12 @@ def invalidate_user_sessions(user_id: int, exclude_session_id: Optional[str] = N
     except Exception as e:
         log("WARN", "invalidate sessions failed", error=str(e))
 
-
-# Bootstrap hooks (stubs overridden later)
+# ----- Bootstrap hooks (stubs overridden later) -----
 def ensure_schema():  # will be implemented in CORE PART 2/10+
     pass
 
 def start_workers_once():  # will be implemented in CORE PART 10/10
     pass
-
 
 @app.before_first_request
 def _bootstrap_once():
@@ -1000,7 +961,6 @@ def _bootstrap_once():
         start_workers_once()
     except Exception as e:
         log("ERROR", "Workers start failed", error=str(e))
-
 
 # ===== BLOCK: DB TRANSACTION CONTEXT =====
 @contextmanager
@@ -1030,8 +990,7 @@ def db_transaction():
     finally:
         setattr(g, "_db_in_tx", False)
 
-
-# ===== END OF CORE PART 1/10 =====
+# ==================== END OF CORE PART 1/10 ====================
 # ===== START OF CORE PART 2/10 =====
 # coding: utf-8
 
@@ -1374,21 +1333,25 @@ def exec_db_affect(query: str, args: Tuple[Any, ...] = ()) -> int:
             span_ctx.__exit__(None, None, None)  # type: ignore
 
 
+# WAL checkpoint throttling (SQLite) — module-level, not per-request
+_WAL_LAST_CHECKPOINT = 0.0
+_WAL_LOCK = threading.Lock()
+
 def wal_checkpoint_if_needed():
     if DIALECT != "sqlite":
         return
-    if not hasattr(g, "_wal_last_checkpoint"):
-        g._wal_last_checkpoint = 0.0
+    global _WAL_LAST_CHECKPOINT
     now = time.time()
-    if (now - g._wal_last_checkpoint) < DB_WAL_CHECKPOINT_INTERVAL:
-        return
-    try:
-        con = get_db()
-        con.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        g._wal_last_checkpoint = now
-        log("DEBUG", "WAL checkpoint completed")
-    except Exception as e:
-        log("WARN", "WAL checkpoint failed", error=str(e))
+    with _WAL_LOCK:
+        if (now - _WAL_LAST_CHECKPOINT) < DB_WAL_CHECKPOINT_INTERVAL:
+            return
+        try:
+            con = get_db()
+            con.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            _WAL_LAST_CHECKPOINT = now
+            log("DEBUG", "WAL checkpoint completed")
+        except Exception as e:
+            log("WARN", "WAL checkpoint failed", error=str(e))
 
 
 def _safe_update_clause(allowed_fields: Set[str], data: Dict[str, Any]) -> Tuple[str, List[Any]]:
@@ -1627,10 +1590,110 @@ def _run_migrations(from_version: int):
         except Exception as e:
             log("WARN", "Add ai_jobs.attempts failed", error=str(e))
 
+    # New migrations (safe, idempotent)
+
+    def _mig_tokens_indexes():
+        """Ensure index/unique index on api_tokens.token_hash and index on approval_tokens.token_hash."""
+        try:
+            if DIALECT == "postgres":
+                conn = get_db()
+                with conn.cursor() as cur:
+                    # Try UNIQUE; if fails due to duplicates, fallback to non-unique index
+                    try:
+                        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)")
+                    except Exception as e:
+                        log("WARN", "UNIQUE idx_api_tokens_token_hash failed, will fallback", error=str(e))
+                        try:
+                            cur.execute("CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)")
+                        except Exception:
+                            pass
+                    try:
+                        cur.execute("CREATE INDEX IF NOT EXISTS idx_approval_tokens_token_hash ON approval_tokens(token_hash)")
+                    except Exception:
+                        pass
+                if not _in_tx():
+                    conn.commit()
+            else:
+                # SQLite
+                try:
+                    exec_db("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)")
+                except Exception as e:
+                    log("WARN", "SQLite UNIQUE idx_api_tokens_token_hash failed, fallback non-unique", error=str(e))
+                    try:
+                        exec_db("CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash)")
+                    except Exception:
+                        pass
+                try:
+                    exec_db("CREATE INDEX IF NOT EXISTS idx_approval_tokens_token_hash ON approval_tokens(token_hash)")
+                except Exception:
+                    pass
+        except Exception as e:
+            log("WARN", "tokens indexes migration failed", error=str(e))
+
+    def _mig_stage_transitions_org():
+        """Add org_id to stage_transitions and backfill for deals; add covering index."""
+        try:
+            if DIALECT == "postgres":
+                conn = get_db()
+                with conn.cursor() as cur:
+                    cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='stage_transitions' AND column_name='org_id'
+                        ) THEN
+                            ALTER TABLE stage_transitions ADD COLUMN org_id INTEGER;
+                        END IF;
+                    END$$;
+                    """)
+                    # backfill for deals
+                    cur.execute("""
+                    UPDATE stage_transitions st
+                    SET org_id = d.org_id
+                    FROM deals d
+                    WHERE st.entity_type='deal' AND d.id = st.entity_id AND st.org_id IS NULL
+                    """)
+                    # Optional: backfill for tasks if нужно (закомментировано)
+                    # cur.execute("""
+                    # UPDATE stage_transitions st
+                    # SET org_id = t.org_id
+                    # FROM tasks t
+                    # WHERE st.entity_type='task' AND t.id = st.entity_id AND st.org_id IS NULL
+                    # """)
+                    # index
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_stage_transitions_org ON stage_transitions(org_id, entity_type, entity_id, created_at)")
+                if not _in_tx():
+                    conn.commit()
+            else:
+                # SQLite
+                cols = query_db("PRAGMA table_info(stage_transitions)") or []
+                names = {c.get("name") for c in cols}
+                if "org_id" not in names:
+                    exec_db("ALTER TABLE stage_transitions ADD COLUMN org_id INTEGER")
+                # backfill for deals
+                try:
+                    exec_db("""
+                    UPDATE stage_transitions
+                    SET org_id = (SELECT d.org_id FROM deals d WHERE d.id = stage_transitions.entity_id)
+                    WHERE entity_type='deal' AND org_id IS NULL
+                    """)
+                except Exception:
+                    pass
+                try:
+                    exec_db("CREATE INDEX IF NOT EXISTS idx_stage_transitions_org ON stage_transitions(org_id, entity_type, entity_id, created_at)")
+                except Exception:
+                    pass
+        except Exception as e:
+            log("WARN", "stage_transitions org migration failed", error=str(e))
+
     start = max(from_version, 0)
     migrations.append((start + 1, _mig_rebuild_indexes, "Rebuild indexes"))
     migrations.append((start + 2, _mig_rebuild_fts, "Rebuild FTS"))
     migrations.append((start + 3, _mig_add_ai_jobs_attempts, "Add ai_jobs.attempts"))
+    # new ones
+    migrations.append((start + 4, _mig_tokens_indexes, "Add token hash indexes"))
+    migrations.append((start + 5, _mig_stage_transitions_org, "Add org_id to stage_transitions and backfill"))
 
     for ver, fn, desc in sorted(migrations, key=lambda x: x[0]):
         if ver > from_version and ver <= SCHEMA_VERSION:
@@ -3680,7 +3743,7 @@ def _pg_schema_additional_part3():
         CREATE TABLE IF NOT EXISTS payroll_metrics (
             id SERIAL PRIMARY KEY,
             org_id INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-            period_id INTEGER NOT NULL REFERENCES payroll_periods(id) ON DELETE CASCADE,
+            period_id INTEGER NOT NOT NULL REFERENCES payroll_periods(id) ON DELETE CASCADE,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             deals_amount DOUBLE PRECISION DEFAULT 0,
             deals_margin DOUBLE PRECISION DEFAULT 0,
@@ -3824,15 +3887,6 @@ def _pg_indexes_part2():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_org ON activity_timeline(org_id, created_at)")
         except Exception:
             pass
-        # Tables may not exist - guard
-        for stmt in [
-            "CREATE INDEX IF NOT EXISTS idx_campaign_events ON campaign_events(campaign_id, created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_ab_results ON ab_results(test_id, ts)",
-        ]:
-            try:
-                cur.execute(stmt)
-            except Exception:
-                pass
         # pgvector indexes (optional)
         if "VECTOR_BACKEND" in globals() and globals().get("VECTOR_BACKEND") == "pgvector":
             try:
@@ -3940,25 +3994,28 @@ def _sqlite_indexes_part4():
 
 # ===== BLOCK: FTS (PG & SQLite) =====
 def _pg_fts_part1():
+    """
+    Postgres FTS с использованием словаря 'russian' вместо 'simple' для лучшей поддержки русскоязычных данных.
+    """
     conn = get_db()
     with conn.cursor() as cur:
         # inbox_messages FTS
         cur.execute("""
         DO $$
         BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
-            WHERE c.relname='inbox_messages' AND a.attname='fts'
-        ) THEN
-            ALTER TABLE inbox_messages ADD COLUMN fts tsvector;
-        END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
+                WHERE c.relname='inbox_messages' AND a.attname='fts'
+            ) THEN
+                ALTER TABLE inbox_messages ADD COLUMN fts tsvector;
+            END IF;
         END $$;
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_inbox_messages_fts ON inbox_messages USING GIN(fts)")
         cur.execute("""
         CREATE OR REPLACE FUNCTION inbox_messages_fts_trigger() RETURNS trigger AS $$
         begin
-            new.fts := to_tsvector('simple', coalesce(new.body,'') || ' ' || coalesce(new.external_user_id,''));
+            new.fts := to_tsvector('russian', coalesce(new.body,'') || ' ' || coalesce(new.external_user_id,''));
             return new;
         end
         $$ LANGUAGE plpgsql;
@@ -3973,19 +4030,19 @@ def _pg_fts_part1():
         cur.execute("""
         DO $$
         BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
-            WHERE c.relname='tasks' AND a.attname='fts'
-        ) THEN
-            ALTER TABLE tasks ADD COLUMN fts tsvector;
-        END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
+                WHERE c.relname='tasks' AND a.attname='fts'
+            ) THEN
+                ALTER TABLE tasks ADD COLUMN fts tsvector;
+            END IF;
         END $$;
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_fts ON tasks USING GIN(fts)")
         cur.execute("""
         CREATE OR REPLACE FUNCTION tasks_fts_trigger() RETURNS trigger AS $$
         begin
-            new.fts := to_tsvector('simple', coalesce(new.title,'') || ' ' || coalesce(new.description,''));
+            new.fts := to_tsvector('russian', coalesce(new.title,'') || ' ' || coalesce(new.description,''));
             return new;
         end
         $$ LANGUAGE plpgsql;
@@ -4000,19 +4057,19 @@ def _pg_fts_part1():
         cur.execute("""
         DO $$
         BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
-            WHERE c.relname='chat_messages' AND a.attname='fts'
-        ) THEN
-            ALTER TABLE chat_messages ADD COLUMN fts tsvector;
-        END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid
+                WHERE c.relname='chat_messages' AND a.attname='fts'
+            ) THEN
+                ALTER TABLE chat_messages ADD COLUMN fts tsvector;
+            END IF;
         END $$;
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_fts ON chat_messages USING GIN(fts)")
         cur.execute("""
         CREATE OR REPLACE FUNCTION chat_messages_fts_trigger() RETURNS trigger AS $$
         begin
-            new.fts := to_tsvector('simple', coalesce(new.body,''));
+            new.fts := to_tsvector('russian', coalesce(new.body,''));
             return new;
         end
         $$ LANGUAGE plpgsql;
@@ -4131,14 +4188,9 @@ def _sqlite_fts_part1():
         log("ERROR", "ensure_fts_sqlite failed", error=str(e))
         raise
 
-
 # ===== END OF CORE PART 4/10 =====
-# ===== START OF CORE PART 5/10 =====
-# coding: utf-8
-
 # ==================== CORE PART 5/10 ====================
 # ===== BLOCK: AI PROVIDER =====
-
 # Defaults for AI/Embeddings (define if not set earlier)
 if "EMBEDDINGS_MODEL" not in globals():
     EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -4158,10 +4210,9 @@ NUMPY_AVAILABLE = False
 SENTENCE_TRANSFORMERS_AVAILABLE = False
 QDRANT_AVAILABLE = False
 
-# AI Circuit Breaker
+# ----- AI Circuit Breaker -----
 _ai_cb_lock = threading.Lock()
 _ai_cb_state = {"failures": 0, "last_failure_time": 0.0, "open": False}
-
 
 def _ai_cb_allow() -> bool:
     with _ai_cb_lock:
@@ -4174,12 +4225,10 @@ def _ai_cb_allow() -> bool:
             return True
         return False
 
-
 def _ai_cb_success():
     with _ai_cb_lock:
         if _ai_cb_state["failures"] > 0:
             _ai_cb_state["failures"] = max(0, _ai_cb_state["failures"] - 1)
-
 
 def _ai_cb_failure():
     with _ai_cb_lock:
@@ -4188,7 +4237,6 @@ def _ai_cb_failure():
         if _ai_cb_state["failures"] >= AI_CIRCUIT_BREAKER_THRESHOLD:
             _ai_cb_state["open"] = True
             log("WARN", "AI circuit breaker opened", failures=_ai_cb_state["failures"])
-
 
 def _ai_request(provider: str, model: str, messages: List[dict], temperature: float, max_tokens: int, stream: bool = False):
     if not AI_API_KEY:
@@ -4280,7 +4328,6 @@ def _ai_request(provider: str, model: str, messages: List[dict], temperature: fl
         if span_ctx:
             span_ctx.__exit__(None, None, None)  # type: ignore
 
-
 def ai_provider_call(prompt: str, system: str = "", model: Optional[str] = None,
                      temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> str:
     if not _ai_cb_allow():
@@ -4309,7 +4356,6 @@ def ai_provider_call(prompt: str, system: str = "", model: Optional[str] = None,
             time.sleep(sleep_for)
     raise RuntimeError(f"AI request failed after retries: {last_err}")
 
-
 def ai_provider_call_streaming(prompt: str, system: str = "", model: Optional[str] = None,
                                temperature: Optional[float] = None, max_tokens: Optional[int] = None):
     if not AI_STREAMING_ENABLED:
@@ -4335,7 +4381,6 @@ def ai_provider_call_streaming(prompt: str, system: str = "", model: Optional[st
         _ai_cb_failure()
         raise
 
-
 def truncate_for_ai_context(text: str, max_chars: int = 8000) -> str:
     if not text:
         return ""
@@ -4343,9 +4388,7 @@ def truncate_for_ai_context(text: str, max_chars: int = 8000) -> str:
         return text
     return text[:max_chars] + "\n\n[... truncated ...]"
 
-
 # ===== BLOCK: EMBEDDINGS & VECTOR SEARCH (memory|pgvector|qdrant) =====
-
 # Lazy optional imports
 def _ensure_numpy():
     global NUMPY_AVAILABLE, np
@@ -4357,7 +4400,6 @@ def _ensure_numpy():
     except Exception:
         NUMPY_AVAILABLE = False
 
-
 def _ensure_st_model():
     global SENTENCE_TRANSFORMERS_AVAILABLE, SentenceTransformer
     if SENTENCE_TRANSFORMERS_AVAILABLE:
@@ -4367,7 +4409,6 @@ def _ensure_st_model():
         SENTENCE_TRANSFORMERS_AVAILABLE = True
     except Exception:
         SENTENCE_TRANSFORMERS_AVAILABLE = False
-
 
 def _ensure_qdrant():
     global QDRANT_AVAILABLE, QdrantClient, qmodels
@@ -4380,10 +4421,8 @@ def _ensure_qdrant():
     except Exception:
         QDRANT_AVAILABLE = False
 
-
 _embeddings_model = None
 _embeddings_lock = threading.Lock()
-
 
 def get_embeddings_model():
     global _embeddings_model
@@ -4400,7 +4439,6 @@ def get_embeddings_model():
                 return None
     return _embeddings_model
 
-
 def _to_bytes_vector(vec: List[float]) -> bytes:
     _ensure_numpy()
     if NUMPY_AVAILABLE:
@@ -4410,7 +4448,6 @@ def _to_bytes_vector(vec: List[float]) -> bytes:
         except Exception:
             pass
     return json.dumps(vec).encode("utf-8")
-
 
 def _from_bytes_vector(b: bytes) -> Optional[List[float]]:
     if not b:
@@ -4426,7 +4463,6 @@ def _from_bytes_vector(b: bytes) -> Optional[List[float]]:
         return json.loads(b.decode("utf-8"))
     except Exception:
         return None
-
 
 def generate_embedding(text: str) -> Optional[List[float]]:
     model = get_embeddings_model()
@@ -4454,7 +4490,6 @@ def generate_embedding(text: str) -> Optional[List[float]]:
         log("ERROR", "Embedding generation failed", error=str(e))
         return None
 
-
 def _qdrant_client() -> Optional["QdrantClient"]:
     _ensure_qdrant()
     if not QDRANT_AVAILABLE:
@@ -4466,7 +4501,6 @@ def _qdrant_client() -> Optional["QdrantClient"]:
     except Exception as e:
         log("WARN", "Qdrant client init failed", error=str(e))
         return None
-
 
 def _qdrant_ensure_collection(client: "QdrantClient", collection: str, dim: int):
     try:
@@ -4502,12 +4536,10 @@ def _qdrant_ensure_collection(client: "QdrantClient", collection: str, dim: int)
     except Exception as e:
         log("WARN", "Qdrant ensure collection failed", error=str(e), collection=collection)
 
-
 def _qdrant_point_id(org_id: int, entity_type: str, entity_id: int) -> int:
     key = f"{int(org_id)}:{entity_type}:{int(entity_id)}"
     h = hashlib.md5(key.encode("utf-8")).hexdigest()
     return int(h[:16], 16) % (2**63 - 1)
-
 
 def store_embedding(org_id: int, entity_type: str, entity_id: int, text: str):
     vec = generate_embedding(text)
@@ -4564,7 +4596,6 @@ def store_embedding(org_id: int, entity_type: str, entity_id: int, text: str):
                 log("WARN", "Qdrant upsert failed", error=str(e))
     except Exception as e:
         log("ERROR", "Store embedding failed", error=str(e))
-
 
 def vector_search(org_id: int, query_text: str, entity_type: Optional[str] = None, top_k: Optional[int] = None) -> List[dict]:
     top_k = int(top_k or VECTOR_SEARCH_TOP_K)
@@ -4631,14 +4662,12 @@ def vector_search(org_id: int, query_text: str, entity_type: Optional[str] = Non
         return [x for _, x in sims[:top_k]]
     return []
 
-
-# RAG helpers
+# ===== RAG helpers =====
 def rag_index_text(org_id: int, entity_type: str, entity_id: int, text: str):
     try:
         store_embedding(org_id, entity_type, entity_id, text)
     except Exception as e:
         log("WARN", "rag_index_text failed", error=str(e))
-
 
 def rag_answer(org_id: int, query_text: str, top_k: int = 5, entity_type: Optional[str] = None) -> dict:
     try:
@@ -4667,7 +4696,6 @@ def rag_answer(org_id: int, query_text: str, top_k: int = 5, entity_type: Option
         return {"ok": True, "answer": answer, "sources": hits[:5]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 # ===== BLOCK: SAFE EVALUATOR (ZERO-CODE) =====
 import ast
@@ -4747,13 +4775,11 @@ class SafeEvaluator(ast.NodeVisitor):
             return True
         raise ValueError("Unsupported expression")
 
-
 def safe_eval_condition(expr: str, context: dict) -> bool:
     try:
         return bool(SafeEvaluator(context).eval(expr))
     except Exception:
         return False
-
 
 # ===== BLOCK: ZERO-CODE AGENT RUNNER & AGENTS =====
 class CustomAgentRunner:
@@ -4882,8 +4908,7 @@ class CustomAgentRunner:
             current = node.get("next_node")
         return {"success": True, "context": context}
 
-
-# Agent base/framework
+# ===== Agent base/framework =====
 class AgentDecision:
     def __init__(self, action: str, confidence: float, reasoning: str, requires_approval: bool = False, metadata: Optional[dict] = None):
         self.action = action
@@ -4903,7 +4928,6 @@ class AgentDecision:
             "metadata": self.metadata,
         }
 
-
 def _action_to_capability(action: str) -> str:
     mapping = {
         "create_deal_and_send_offer": "update_deal",
@@ -4922,7 +4946,6 @@ def _action_to_capability(action: str) -> str:
         "assign_to_human": "read_data",
     }
     return mapping.get(action, "read_data")
-
 
 class BaseAgent:
     def __init__(self, org_id: int, user_id: Optional[int], capabilities: Set[str], agent_name: Optional[str] = None):
@@ -4987,7 +5010,6 @@ class BaseAgent:
         if len(self.memory) > 100:
             self.memory = self.memory[-100:]
 
-
 class SalesAssistantAgent(BaseAgent):
     def __init__(self, org_id: int, user_id: Optional[int]):
         super().__init__(org_id, user_id, {"read_data", "update_deal", "send_email", "generate_document", "create_task", "predict_outcome"}, agent_name="SalesAssistant")
@@ -5031,7 +5053,6 @@ class SalesAssistantAgent(BaseAgent):
             return {"task_id": tid}
         return {"status": "ok"}
 
-
 class MeetingSecretaryAgent(BaseAgent):
     def __init__(self, org_id: int, user_id: Optional[int]):
         super().__init__(org_id, user_id, {"read_data", "create_task", "send_message"}, agent_name="MeetingSecretary")
@@ -5063,7 +5084,6 @@ class MeetingSecretaryAgent(BaseAgent):
                 pass
             return {"notes_id": notes_id}
         return {"status": "ok"}
-
 
 class IntelligentInboxAgent(BaseAgent):
     def __init__(self, org_id: int, user_id: Optional[int]):
@@ -5111,7 +5131,6 @@ class IntelligentInboxAgent(BaseAgent):
             return {"assigned": True}
         return {"status": "ok"}
 
-
 def get_agent(agent_name: str, org_id: int, user_id: Optional[int]) -> Optional[BaseAgent]:
     name_l = (agent_name or "").lower()
     if name_l in ("sales", "salesassistant", "sales_assistant"):
@@ -5122,13 +5141,11 @@ def get_agent(agent_name: str, org_id: int, user_id: Optional[int]) -> Optional[
         return IntelligentInboxAgent(org_id, user_id)
     return None
 
-
 def run_agent(agent_name: str, org_id: int, user_id: Optional[int], context: dict) -> dict:
     ag = get_agent(agent_name, org_id, user_id)
     if not ag:
         return {"success": False, "error": "unknown_agent"}
     return ag.execute(context or {})
-
 
 # ===== BLOCK: MULTI-AGENT ORCHESTRATOR =====
 from concurrent.futures import ThreadPoolExecutor
@@ -5164,7 +5181,6 @@ class AgentOrchestrator:
             return {"success": False, "error": str(e), "results": results}
         return {"success": True, "results": results}
 
-
 # ===== BLOCK: MAIL HELPERS & CONVERSATIONAL BI (STUB) =====
 def _send_mail_helper(to: str, subject: str, body: str) -> bool:
     if not to:
@@ -5194,7 +5210,6 @@ def _send_mail_helper(to: str, subject: str, body: str) -> bool:
         log("WARN", "send_mail failed", error=str(e))
         return False
 
-
 def _send_mail_company(company_id: Optional[int], subject: str, body: str) -> bool:
     if not company_id:
         return False
@@ -5203,21 +5218,20 @@ def _send_mail_company(company_id: Optional[int], subject: str, body: str) -> bo
         return False
     return _send_mail_helper(row["email"], subject, body)
 
-
 def conversational_bi_query(nl_query: str, org_id: int, user_id: int) -> dict:
     if not CONVERSATIONAL_BI_ENABLED:
         return {"ok": False, "error": "Disabled"}
     # Placeholder: NL2SQL over whitelisted metrics will be implemented later (partially)
     return {"ok": True, "kind": "text", "data": "Not implemented yet"}
 
-
-# ===== END OF CORE PART 5/10 =====
+# ==================== END OF CORE PART 5/10 ====================
 # ===== START OF CORE PART 6/10 =====
 # coding: utf-8
 
 # ==================== CORE PART 6/10 ====================
 # ===== BLOCK: BUSINESS LOGIC: TASKS =====
 from typing import Iterable
+from zoneinfo import ZoneInfo  # TZ-aware ICS generation
 
 # Safe notify shim (use global notify if defined later)
 if "notify" not in globals():
@@ -5426,6 +5440,12 @@ def add_task_comment(task_id: int, user_id: Optional[int], body: str, fmt: str =
             for a in attachments:
                 fid = a.get("file_id")
                 if fid:
+                    # Защита по аренде: файл должен принадлежать той же org, что и задача
+                    if org_id is not None:
+                        ok = query_db("SELECT 1 AS x FROM files WHERE id=? AND org_id=?", (int(fid), int(org_id)), one=True)
+                        if not ok:
+                            log("WARN", "task_comment attachment org mismatch", file_id=int(fid), task_id=task_id, org_id=int(org_id))
+                            continue
                     exec_db(
                         "INSERT INTO task_comment_attachments (comment_id, file_id, created_at) VALUES (?, ?, ?)",
                         (cid, int(fid), utc_now())
@@ -5715,11 +5735,10 @@ class CalendarService:
         except Exception:
             pass
 
-        # Conflicts (non-blocking)
+        # Conflicts (non-blocking, org-scoped)
         conflicts = []
         for uid in (participants or []):
             conflicts.extend(CalendarService.check_conflicts(uid, start_time, end_time, exclude_event_id=event_id))
-
         return {"event_id": event_id, "conflicts": conflicts}
 
     @staticmethod
@@ -5851,15 +5870,17 @@ class CalendarService:
     @staticmethod
     def check_conflicts(user_id: int, start_time: str, end_time: str, exclude_event_id: Optional[int] = None) -> List[dict]:
         """
-        Проверка конфликтов по user_id (организатор или участник).
+        Проверка конфликтов по user_id (организатор или участник), с учётом org_id пользователя.
         """
         start = ensure_iso_datetime(start_time) or ""
         end = ensure_iso_datetime(end_time) or ""
         where = [
+            # org_id фильтруется по org пользователя
+            "org_id = (SELECT org_id FROM users WHERE id=?)",
             "(organizer_id=? OR id IN (SELECT event_id FROM event_participants WHERE user_id=?))",
             "start_time < ? AND end_time > ?"
         ]
-        params: List[Any] = [user_id, user_id, end, start]
+        params: List[Any] = [user_id, user_id, user_id, end, start]
         if exclude_event_id:
             where.append("id != ?")
             params.append(exclude_event_id)
@@ -5984,20 +6005,36 @@ class CalendarService:
         ev = query_db("SELECT * FROM calendar_events WHERE id=?", (event_id,), one=True)
         if not ev:
             raise ValueError("event not found")
+        # TZ-aware conversion to UTC
+        tzname = (ev.get("timezone") or "UTC").strip() or "UTC"
+        try:
+            local_tz = ZoneInfo(tzname)
+        except Exception:
+            local_tz = ZoneInfo("UTC")
+        try:
+            dtstart_local = datetime.strptime(ev["start_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=local_tz)
+        except Exception:
+            dtstart_local = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+        try:
+            dtend_local = datetime.strptime(ev["end_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=local_tz)
+        except Exception:
+            dtend_local = dtstart_local + timedelta(hours=1)
+        dtstart = dtstart_local.astimezone(timezone.utc)
+        dtend = dtend_local.astimezone(timezone.utc)
+
         uid = f"{event_id}@singularity.local"
-        dtstart = ev["start_time"].replace(" ", "T") + "Z"
-        dtend = ev["end_time"].replace(" ", "T") + "Z"
         title = (ev.get("title") or "Event").replace("\n", " ")
         desc = (ev.get("description") or "").replace("\n", "\\n")
         loc = (ev.get("location") or "").replace("\n", " ")
+
         ics = f"""BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Singularity//CRM 5.2//EN
 BEGIN:VEVENT
 UID:{uid}
 DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}
-DTSTART:{dtstart}
-DTEND:{dtend}
+DTSTART:{dtstart.strftime('%Y%m%dT%H%M%SZ')}
+DTEND:{dtend.strftime('%Y%m%dT%H%M%SZ')}
 SUMMARY:{title}
 DESCRIPTION:{desc}
 LOCATION:{loc}
@@ -6011,6 +6048,7 @@ END:VCALENDAR
         """
         Находит возможные слоты времени с учетом занятости участников и рабочих часов.
         Упрощенный алгоритм: шаг 30 минут, пересечение свободного времени.
+        Добавлен фильтр по org_id пользователя через подзапрос (по каждому участнику).
         """
         duration = timedelta(minutes=max(15, int(duration_minutes or 60)))
         start = CalendarService._dt_from_iso(ensure_iso_datetime(start_date) or "")
@@ -6018,12 +6056,15 @@ END:VCALENDAR
         if end <= start:
             return []
 
-        # Build busy intervals per participant
+        # Build busy intervals per participant (org-scoped by user)
         busy_map: Dict[int, List[Tuple[datetime, datetime]]] = {}
         for uid in participants:
             evs = query_db(
-                "SELECT start_time, end_time FROM calendar_events WHERE (organizer_id=? OR id IN (SELECT event_id FROM event_participants WHERE user_id=?)) AND start_time < ? AND end_time > ?",
-                (uid, uid, CalendarService._iso_utc(end), CalendarService._iso_utc(start))
+                "SELECT start_time, end_time FROM calendar_events "
+                "WHERE org_id = (SELECT org_id FROM users WHERE id=?) "
+                "AND (organizer_id=? OR id IN (SELECT event_id FROM event_participants WHERE user_id=?)) "
+                "AND start_time < ? AND end_time > ?",
+                (uid, uid, uid, CalendarService._iso_utc(end), CalendarService._iso_utc(start))
             ) or []
             busy_map[uid] = [(CalendarService._dt_from_iso(e["start_time"]), CalendarService._dt_from_iso(e["end_time"])) for e in evs]
 
@@ -6800,12 +6841,8 @@ def payroll_lock_period(org_id: int, period_key: str, lock: bool = True) -> bool
     return True
 
 # ===== END OF CORE PART 7/10 =====
-# ===== START OF CORE PART 8/10 =====
-# coding: utf-8
-
 # ==================== CORE PART 8/10 ====================
 # ===== BLOCK: DIGITAL TWIN (STATE, FORECASTS, SIMULATIONS, INSIGHTS) =====
-
 # Cache helpers (L1 TTLCache + L2 Redis JSON)
 def _cache_get_json(key: str) -> Optional[Any]:
     try:
@@ -6819,7 +6856,6 @@ def _cache_get_json(key: str) -> Optional[Any]:
     except Exception:
         return None
 
-
 def _cache_set_json(key: str, value: Any, ttl: int = CACHE_DEFAULT_TTL):
     try:
         payload = json.dumps(value, ensure_ascii=False)
@@ -6830,7 +6866,6 @@ def _cache_set_json(key: str, value: Any, ttl: int = CACHE_DEFAULT_TTL):
             _global_cache.set(key, value, ttl)
         except Exception:
             pass
-
 
 def _ensure_mv_tables():
     """
@@ -6860,7 +6895,6 @@ def _ensure_mv_tables():
             """, ())
     except Exception:
         pass
-
 
 class BusinessTwin:
     def __init__(self, org_id: int):
@@ -7164,8 +7198,7 @@ class BusinessTwin:
         backlog_days = (open_tasks / max(1, cap)) * 5.0
         return {"capacity_per_week": cap, "estimated_backlog_days": round(backlog_days, 1)}
 
-
-# Snapshots
+# ===== Snapshots =====
 def save_digital_twin_snapshot(org_id: int, twin: BusinessTwin):
     try:
         exec_db(
@@ -7174,9 +7207,8 @@ def save_digital_twin_snapshot(org_id: int, twin: BusinessTwin):
         )
     except Exception as e:
         log("WARN", "save snapshot failed", error=str(e))
-
-
-# Decision Center integration
+# ===== CORE PART 8/10 — часть 2/2 =====
+# ===== Decision Center integration =====
 class DecisionCenter:
     def consult(self, query: dict) -> dict:
         try:
@@ -7210,13 +7242,11 @@ class DecisionCenter:
     def next_best_actions(self, twin: BusinessTwin, limit: int = 5) -> List[dict]:
         return twin.next_best_actions(limit=limit)
 
-
 # Provide DECISION_CENTER singleton
 if "DECISION_CENTER" not in globals():
     DECISION_CENTER = DecisionCenter()
 
-
-# Extend BusinessTwin with NBA + simulations
+# ===== Extend BusinessTwin with NBA + simulations =====
 def _twin_nba(self: BusinessTwin, limit: int = 5) -> List[dict]:
     actions: List[dict] = []
     st = self.state
@@ -7233,7 +7263,6 @@ def _twin_nba(self: BusinessTwin, limit: int = 5) -> List[dict]:
         actions.append({"priority": "low", "text": "Провести ревизию воронки и статусов задач"})
     actions.sort(key=lambda a: {"high": 0, "normal": 1, "low": 2}.get(a["priority"], 2))
     return actions[:limit]
-
 
 def _twin_simulate(self: BusinessTwin, scenario: dict) -> dict:
     stype = (scenario.get("type") or "").lower()
@@ -7290,13 +7319,11 @@ def _twin_simulate(self: BusinessTwin, scenario: dict) -> dict:
         }
     return {"scenario": "unknown", "message": "Сценарий не поддерживается"}
 
-
 # Bind methods
 BusinessTwin.next_best_actions = _twin_nba  # type: ignore
 BusinessTwin.simulate_scenario = _twin_simulate  # type: ignore
 
-
-# Proactive scanner: push insights if risk detected
+# ===== Proactive scanner: push insights if risk detected =====
 def twin_proactive_scan(org_id: int):
     try:
         twin = BusinessTwin(org_id)
@@ -7341,11 +7368,10 @@ def twin_proactive_scan(org_id: int):
     except Exception as e:
         log("WARN", "twin_proactive_scan failed", error=str(e))
 
-
 def _mv_refresh_dashboard_early():
     """
     EARLY (deprecated) variant of mv_dashboard refresh kept for back-compat.
-    Final implementation overrides in CORE PART 10/10.
+    Final implementation overrides in _mv_refresh_dashboard().
     """
     try:
         _ensure_mv_tables()
@@ -7377,10 +7403,67 @@ def _mv_refresh_dashboard_early():
     except Exception as e:
         log("WARN", "mv_refresh_dashboard_early failed", error=str(e))
 
-# ===== END OF CORE PART 8/10 =====
-# ===== START OF CORE PART 9/10 =====
-# coding: utf-8
+def _mv_refresh_dashboard():
+    """
+    Full refresh for mv_dashboard (used by maintenance_worker).
+    Computes key rollups: open_tasks, overdue_tasks, open_deals, pipeline_value, mrr, arr.
+    """
+    try:
+        _ensure_mv_tables()
+        orgs = query_db("SELECT id FROM orgs", ()) or []
+        now = utc_now()
+        for o in orgs:
+            oid = int(o["id"])
 
+            # Metrics
+            open_tasks = query_db(
+                "SELECT COUNT(*) AS c FROM tasks WHERE org_id=? AND status NOT IN ('done','cancelled')",
+                (oid,), one=True
+            )
+            overdue_tasks = query_db(
+                "SELECT COUNT(*) AS c FROM tasks WHERE org_id=? AND status NOT IN ('done','cancelled') AND due_at IS NOT NULL AND due_at < ?",
+                (oid, now), one=True
+            )
+            open_deals = query_db(
+                "SELECT COUNT(*) AS c FROM deals WHERE org_id=? AND status='open'",
+                (oid,), one=True
+            )
+            pipeline_val = query_db(
+                "SELECT COALESCE(SUM(amount),0) AS s FROM deals WHERE org_id=? AND status='open'",
+                (oid,), one=True
+            )
+            won30 = query_db(
+                "SELECT COALESCE(SUM(amount),0) AS s FROM deals WHERE org_id=? AND status='won' AND won_at >= ?",
+                (oid, (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")), one=True
+            )
+            mrr = float((won30 or {}).get("s") or 0.0) / 12.0
+            arr = mrr * 12.0
+
+            pairs = [
+                ("open_tasks", float((open_tasks or {}).get("c") or 0)),
+                ("overdue_tasks", float((overdue_tasks or {}).get("c") or 0)),
+                ("open_deals", float((open_deals or {}).get("c") or 0)),
+                ("pipeline_value", float((pipeline_val or {}).get("s") or 0.0)),
+                ("mrr", float(mrr)),
+                ("arr", float(arr)),
+            ]
+
+            for k, v in pairs:
+                if DIALECT == "postgres":
+                    exec_db(
+                        "INSERT INTO mv_dashboard (org_id, key, value_number, updated_at) VALUES (?, ?, ?, NOW()) "
+                        "ON CONFLICT (org_id, key) DO UPDATE SET value_number=EXCLUDED.value_number, updated_at=EXCLUDED.updated_at",
+                        (oid, k, v)
+                    )
+                else:
+                    exec_db(
+                        "INSERT OR REPLACE INTO mv_dashboard (org_id, key, value_number, updated_at) VALUES (?, ?, ?, ?)",
+                        (oid, k, v, now)
+                    )
+    except Exception as e:
+        log("WARN", "mv_refresh_dashboard failed", error=str(e))
+
+# ==================== END OF CORE PART 8/10 ====================
 # ==================== CORE PART 9/10 ====================
 # ===== BLOCK: API ROUTES =====
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -7394,7 +7477,6 @@ def verify_password(password: str, password_hash: str) -> bool:
         return check_password_hash(password_hash, password)
     except Exception:
         return False
-
 
 # --- Storage helpers (Local/S3) ---
 def _safe_local_storage_path(upload_dir: str, key: str) -> str:
@@ -7525,7 +7607,6 @@ def get_file_by_id(file_id: int) -> Optional[Tuple[bytes, str, str]]:
         return None
     return (data, meta["name"], meta.get("content_type") or "application/octet-stream")
 
-
 # --- Avatar processing ---
 def process_avatar(data: bytes, filename: str) -> Tuple[bytes, str, str]:
     try:
@@ -7561,7 +7642,6 @@ def process_avatar(data: bytes, filename: str) -> Tuple[bytes, str, str]:
     except Exception as e:
         log("ERROR", "Avatar processing failed", error=str(e))
         raise ValueError("Invalid image file")
-
 
 # --- HTML sanitization ---
 def _sanitize_html_with_protocols(html: str, allowed_protocols: List[str]) -> str:
@@ -7604,8 +7684,7 @@ def sanitize_html(html: str, allow_external_images: bool = True) -> str:
 def sanitize_document_html(html: str) -> str:
     return sanitize_html(html, allow_external_images=False)
 
-
-# --- Notification channels + SSE endpoint ---
+# --- Notification channels (+ helpers) ---
 def _notify_telegram(chat_id: Optional[str], text: str) -> bool:
     if not chat_id or not os.getenv("TELEGRAM_BOT_TOKEN"):
         return False
@@ -7656,45 +7735,21 @@ def notify_user_channels(user_id: int, message: str) -> dict:
         log("WARN", "notify_user_channels failed", error=str(e))
     return res
 
-@app.route("/sse")
+# Тест уведомления (для страницы Settings)
+@app.route("/ui/notify/test", methods=["POST"])
 @_login_required
-def sse_stream():
-    if not SSE_ENABLED:
-        return "SSE disabled", 503
-    user = g.user
-    uid = int(user["id"])
-    with _sse_lock:
-        existing = _sse_queues.get(uid, [])
-        if len(existing) >= SSE_MAX_CONN_PER_USER:
-            return "Too many connections", 429
-        q = Queue(maxsize=200)
-        _sse_queues.setdefault(uid, []).append(q)
-
-    def generate():
-        try:
-            # initial event
-            yield "data: " + json.dumps({"event": "connected"}, ensure_ascii=False) + "\n\n"
-            last_ping = time.time()
-            while not _shutdown_event.is_set():
-                try:
-                    msg = q.get(timeout=15)
-                    yield f"event: {msg['event']}\n"
-                    yield f"data: {json.dumps(msg['data'], ensure_ascii=False)}\n\n"
-                except Empty:
-                    if (time.time() - last_ping) >= 15:
-                        yield ": ping\n\n"
-                        last_ping = time.time()
-        finally:
-            with _sse_lock:
-                lst = _sse_queues.get(uid, [])
-                if q in lst:
-                    lst.remove(q)
-                if not lst and uid in _sse_queues:
-                    _sse_queues.pop(uid, None)
-
-    return Response(stream_with_context(generate()), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
+@_csrf_protect
+def ui_notify_test():
+    data = request.get_json() or {}
+    title = (data.get("title") or "Тест уведомления")
+    body = (data.get("body") or "Проверка центра уведомлений")
+    kind = (data.get("kind") or "info")
+    try:
+        sse_push(int(g.user["id"]), "notify.center", {"title": title, "body": body, "kind": kind, "ts": utc_now()})
+        notify_user_channels(int(g.user["id"]), f"{title}: {body}")
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 # --- Idempotency helper ---
 def _idempotency_guard(key: str, ttl: int = 60) -> bool:
@@ -7717,7 +7772,6 @@ def _idempotency_guard(key: str, ttl: int = 60) -> bool:
     _global_cache.set(full, True, ttl=ttl)
     return True
 
-
 # --- AUTH & SESSION ROUTES ---
 MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
 LOCKOUT_DURATION = int(os.getenv("LOCKOUT_DURATION", "900"))  # 15 min
@@ -7733,12 +7787,12 @@ def login():
             return redirect(url_for("index"))
         tmpl = """
         <form method="post" style="max-width:360px;margin:40px auto;font-family:sans-serif;">
-          <h3>Вход</h3>
-          <input name="org_slug" placeholder="org" autofocus class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="username" placeholder="user" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="password" type="password" placeholder="password" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="totp" placeholder="2FA (если включено)" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <button type="submit" class="button" style="padding:8px 12px;">Login</button>
+        <h3>Вход</h3>
+        <input name="org_slug" placeholder="org" autofocus class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="username" placeholder="user" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="password" type="password" placeholder="password" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="totp" placeholder="2FA (если включено)" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <button type="submit" class="button" style="padding:8px 12px;">Login</button>
         </form>
         """
         return Response(tmpl, 200)
@@ -7836,12 +7890,12 @@ def register():
     if request.method == "GET":
         tmpl = """
         <form method="post" style="max-width:360px;margin:40px auto;font-family:sans-serif;">
-          <h3>Регистрация</h3>
-          <input name="org_slug" placeholder="org" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="username" placeholder="user" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="email" placeholder="email" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <input name="password" type="password" placeholder="password (>=12)" class="input" style="width:100%;padding:8px;margin:6px 0;">
-          <button type="submit" class="button" style="padding:8px 12px;">Register</button>
+        <h3>Регистрация</h3>
+        <input name="org_slug" placeholder="org" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="username" placeholder="user" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="email" placeholder="email" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <input name="password" type="password" placeholder="password (>=12)" class="input" style="width:100%;padding:8px;margin:6px 0;">
+        <button type="submit" class="button" style="padding:8px 12px;">Register</button>
         </form>
         """
         return Response(tmpl, 200)
@@ -7874,7 +7928,6 @@ def register():
     session["username"] = username
     add_audit(int(org_id), int(user_id or 0), "auth.register", "user", int(user_id or 0), {})  # type: ignore
     return redirect(url_for("index"))
-
 
 # --- Profile & tokens/system info ---
 @app.route("/api/profile", methods=["GET"])
@@ -8077,7 +8130,6 @@ self.addEventListener('fetch', (e)=>{ /* pass-through */ });
 """.strip()
     return Response(js, mimetype="application/javascript")
 
-
 # --- APPROVAL ROUTE (secure: GET=confirm, POST=apply) ---
 @app.route("/approve/<path:token>", methods=["GET"])
 def approve_token_page(token: str):
@@ -8095,16 +8147,16 @@ def approve_token_page(token: str):
         return Response("Token invalid/expired", 400)
     # Render confirm page with POST form (CSRF-protected via session token)
     tmpl = f"""
-    <html><head><meta charset="utf-8"><title>Подтверждение</title></head>
-    <body style="font-family:sans-serif;max-width:520px;margin:40px auto;">
-      <h3>Подтверждение действия</h3>
-      <p>Вы собираетесь подтвердить действие для: {row.get('entity_type')} #{row.get('entity_id')}</p>
-      <form method="post">
-        <input type="hidden" name="csrf_token" value="{{{{ session.get('csrf_token','') }}}}">
-        <button type="submit" style="padding:8px 12px;">Подтвердить</button>
-      </form>
-    </body></html>
-    """
+<html><head><meta charset="utf-8"><title>Подтверждение</title></head>
+<body style="font-family:sans-serif;max-width:520px;margin:40px auto;">
+<h3>Подтверждение действия</h3>
+<p>Вы собираетесь подтвердить действие для: {row.get('entity_type')} #{row.get('entity_id')}</p>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{{{ session.get('csrf_token','') }}}}">
+<button type="submit" style="padding:8px 12px;">Подтвердить</button>
+</form>
+</body></html>
+"""
     return Response(render_template_string(tmpl), 200)
 
 @app.route("/approve/<path:token>", methods=["POST"])
@@ -8121,7 +8173,8 @@ def approve_token_apply(token: str):
         return Response("Token invalid/expired", 400)
     exec_db("UPDATE approval_tokens SET used=1 WHERE jti=?", (jti,))
     return Response("Approved", 200)
-
+# ===== END OF CORE PART 9/10 (часть 1/2) =====
+# ==================== CORE PART 9/10 (часть 2/2) ====================
 
 # --- COMPANIES LIST (added to match OpenAPI) ---
 @app.route("/api/companies/list", methods=["GET"])
@@ -8142,11 +8195,10 @@ def api_companies_list():
     total_row = query_db(f"SELECT COUNT(*) AS c FROM companies WHERE {wc}", tuple(params), one=True)
     items = query_db(
         f"""SELECT id, name, inn, phone, phone_norm, email, address, notes, industry, score, created_at, updated_at
-            FROM companies WHERE {wc} ORDER BY (updated_at IS NULL), updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+FROM companies WHERE {wc} ORDER BY (updated_at IS NULL), updated_at DESC, id DESC LIMIT ? OFFSET ?""",
         (*params, per_page, offset)
     ) or []
     return jsonify(ok=True, items=items, page=page, per_page=per_page, total=int((total_row or {}).get("c") or 0))
-
 
 # --- TASKS API ---
 @app.route("/api/tasks/list", methods=["GET"])
@@ -8175,11 +8227,11 @@ def api_tasks_list():
     total_row = query_db(f"SELECT COUNT(*) AS c FROM tasks t WHERE {wc}", tuple(params), one=True)
     items = query_db(
         f"""SELECT t.*, u.username AS assignee_name, c.name AS company_name, d.name AS department_name
-            FROM tasks t
-            LEFT JOIN users u ON t.assignee_id=u.id
-            LEFT JOIN companies c ON t.company_id=c.id
-            LEFT JOIN departments d ON t.department_id=d.id
-            WHERE {wc} ORDER BY t.created_at DESC LIMIT ? OFFSET ?""",
+FROM tasks t
+LEFT JOIN users u ON t.assignee_id=u.id
+LEFT JOIN companies c ON t.company_id=c.id
+LEFT JOIN departments d ON t.department_id=d.id
+WHERE {wc} ORDER BY t.created_at DESC LIMIT ? OFFSET ?""",
         (*params, per_page, offset)
     ) or []
     for it in items:
@@ -8192,6 +8244,9 @@ def api_tasks_list():
 def api_task_create():
     user = g.user
     data = request.get_json() or {}
+    # идемпотентность (по заголовку Idempotency-Key)
+    if not _idempotency_guard(f"task_create:{user['org_id']}"):
+        return jsonify(ok=True, duplicated=True)
     try:
         tid = create_task(user["org_id"], data.get("title",""), description=data.get("description",""),
                           assignee_id=data.get("assignee_id"), due_at=data.get("due_at"),
@@ -8255,7 +8310,6 @@ def api_task_comment_upload():
     if not is_allowed_upload_type(ctype): return jsonify(ok=False, error="File type not allowed"), 400
     info = store_file(user["org_id"], secure_filename(f.filename), raw, ctype, user["id"])
     return jsonify(ok=True, file=info)
-
 
 # --- API ROUTES - CALENDAR ---
 @app.route('/api/calendar/events', methods=['GET'])
@@ -8414,7 +8468,6 @@ def api_calendar_views():
             exec_db_affect(f"UPDATE calendar_views SET {set_clause} WHERE user_id=?", tuple(params))
     return jsonify(ok=True)
 
-
 # --- EDO SIGNATURES (DIADOC/SBIS/ASTRAL) ---
 def _edo_call(provider: str, endpoint: str, payload: dict, timeout: int = 10) -> dict:
     """
@@ -8488,16 +8541,50 @@ def api_edo_status():
     res = _edo_call(provider, f"status/{document_id}", {})
     return jsonify(res)
 
-# ===== END OF CORE PART 9/10 =====
-# ===== START OF CORE PART 10/10 (1/3-A) =====
-# coding: utf-8
-
+# ==================== END OF CORE PART 9/10 ====================
 # ==================== CORE PART 10/10 (1/3-A) ====================
 # ===== BLOCK: API ROUTES — INBOX, LOOKUPS, THREADS (PART A) =====
+
+# --- Idempotency guard (Redis NX+EX with L1 fallback), uses Idempotency-Key header if present ---
+def _idempotency_guard(scope_key: str, ttl: int = 60) -> bool:
+    """
+    Returns True if operation is allowed (first time), False if duplicate within TTL.
+    Priority: Idempotency-Key header (set earlier in g.idempotency_key) → Redis NX+EX → L1 TTL cache.
+    Without header: coarse guard by scope+client_ip for a short window.
+    """
+    try:
+        idem = (getattr(g, "idempotency_key", "") or "").strip()
+        if idem:
+            key = f"idem:{scope_key}:{idem}"
+            r = get_redis()
+            if r:
+                try:
+                    ok = bool(_redis_cb.call(r.set, key, "1", nx=True, ex=int(ttl)))
+                    if ok:
+                        return True
+                    return False
+                except Exception:
+                    pass
+            # Fallback to L1
+            if _global_cache.get(key):
+                return False
+            _global_cache.set(key, True, ttl)
+            return True
+        # No Idempotency-Key: coarse guard by IP for a short time
+        ip = get_client_ip()
+        key = f"idem:{scope_key}:{ip}"
+        if _global_cache.get(key):
+            return False
+        _global_cache.set(key, True, min(5, int(ttl)))
+        return True
+    except Exception:
+        # Fail-open to avoid blocking in case of guard failure
+        return True
 
 # --- Inbox helper logic used by agents/APIs ---
 def create_inbox_thread(org_id: int, channel_id: Optional[int], subject: str,
                         company_id: Optional[int] = None, contact_id: Optional[int] = None) -> int:
+    subject = (subject or "").strip()
     with db_transaction():
         tid = exec_db(
             "INSERT INTO inbox_threads (org_id, channel_id, subject, status, priority, company_id, contact_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -8507,56 +8594,80 @@ def create_inbox_thread(org_id: int, channel_id: Optional[int], subject: str,
             add_audit(org_id, g.get("user", {}).get("id"), "thread.created", "thread", int(tid or 0), {"subject": subject})  # type: ignore
         except Exception:
             pass
-    return int(tid or 0)
-
+        return int(tid or 0)
 
 def add_message(thread_id: int, sender_type: str, body: str, user_id: Optional[int] = None,
                 external_user_id: str = "", internal_note: bool = False,
                 attachments: Optional[List[dict]] = None) -> Optional[int]:
-    if not thread_id or (not body and not attachments):
+    """
+    Adds message to inbox thread. Validates attachments belong to the same org as the thread.
+    """
+    if not thread_id or ((not body or not str(body).strip()) and not attachments):
         return None
+
+    # Determine org of the thread for attachment/org consistency checks
+    org_row = query_db("SELECT org_id FROM inbox_threads WHERE id=?", (thread_id,), one=True)
+    org_id = int((org_row or {}).get("org_id") or 0)
+    if not org_id:
+        return None
+
     with db_transaction():
         mid = exec_db(
             "INSERT INTO inbox_messages (thread_id, sender_type, user_id, external_user_id, body, internal_note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (thread_id, sender_type, user_id, external_user_id, body or "", 1 if internal_note else 0, utc_now())
+            (int(thread_id), (sender_type or "agent"), user_id, (external_user_id or ""), body or "", 1 if internal_note else 0, utc_now())
         )
         try:
             exec_db_affect("UPDATE inbox_threads SET last_message_at=? WHERE id=?", (utc_now(), thread_id))
-            org_id_row = query_db("SELECT org_id FROM inbox_threads WHERE id=?", (thread_id,), one=True)
-            add_audit(int((org_id_row or {}).get("org_id") or 0), user_id, "thread.message_added", "thread", thread_id,
-                      {"message_id": int(mid or 0), "internal": bool(internal_note)})  # type: ignore
+            try:
+                add_audit(org_id, user_id, "thread.message_added", "thread", int(thread_id),
+                          {"message_id": int(mid or 0), "internal": bool(internal_note)})  # type: ignore
+            except Exception:
+                pass
         except Exception:
             pass
+
+        # Attachments: secure check — file must belong to same org
         if attachments:
-            for a in attachments:
-                fid = a.get("file_id")
-                if fid:
+            for a in (attachments or []):
+                try:
+                    fid = int(a.get("file_id") or 0)
+                except Exception:
+                    fid = 0
+                if not fid:
+                    continue
+                ok = query_db("SELECT 1 AS x FROM files WHERE id=? AND org_id=?", (fid, org_id), one=True)
+                if ok:
                     exec_db(
                         "INSERT INTO message_attachments (message_id, file_id, created_at) VALUES (?, ?, ?)",
                         (mid, int(fid), utc_now())
                     )
+                else:
+                    log("WARN", "Attachment skipped due to org mismatch", file_id=fid, thread_id=thread_id, org_id=org_id)
+
+    # Notify assignee via SSE (best-effort)
     try:
         thr = query_db("SELECT assignee_id FROM inbox_threads WHERE id=?", (thread_id,), one=True)
         if thr and thr.get("assignee_id"):
-            sse_push(int(thr["assignee_id"]), "thread.message", {"thread_id": thread_id, "internal": bool(internal_note)})
+            sse_push(int(thr["assignee_id"]), "thread.message", {"thread_id": int(thread_id), "internal": bool(internal_note)})
     except Exception:
         pass
     return int(mid or 0)
 
-
 # --- Lookups (by phone/email/inn) for CTI/Inbox ---
 def lookup_by_phone(org_id: int, phone: str) -> dict:
-    norm = normalize_phone(phone)
+    norm = normalize_phone(phone or "")
     companies = query_db("SELECT * FROM companies WHERE org_id=? AND (phone_norm=? OR phone=?)", (org_id, norm, phone)) or []
     contacts = query_db("SELECT * FROM contacts WHERE org_id=? AND (phone_norm=? OR phone=?)", (org_id, norm, phone)) or []
     return {"companies": [dict(c) for c in companies], "contacts": [dict(c) for c in contacts]}
 
 def lookup_by_email(org_id: int, email: str) -> dict:
+    email = (email or "").strip()
     companies = query_db("SELECT * FROM companies WHERE org_id=? AND email=?", (org_id, email)) or []
     contacts = query_db("SELECT * FROM contacts WHERE org_id=? AND email=?", (org_id, email)) or []
     return {"companies": [dict(c) for c in companies], "contacts": [dict(c) for c in contacts]}
 
 def lookup_by_inn(org_id: int, inn: str) -> List[dict]:
+    inn = (inn or "").strip()
     companies = query_db("SELECT * FROM companies WHERE org_id=? AND inn=?", (org_id, inn)) or []
     return [dict(c) for c in companies]
 
@@ -8571,7 +8682,11 @@ def api_lookup():
     email_addr = request.args.get("email")
     result = {"companies": [], "contacts": []}
     if company_id:
-        c = query_db("SELECT * FROM companies WHERE id=? AND org_id=?", (company_id, org_id), one=True)
+        try:
+            cid = int(company_id)
+        except Exception:
+            cid = 0
+        c = query_db("SELECT * FROM companies WHERE id=? AND org_id=?", (cid, org_id), one=True)
         if c:
             result["companies"] = [dict(c)]
     elif phone:
@@ -8588,9 +8703,9 @@ def api_lookup():
 def api_lookup_multi():
     user = g.user
     data = request.get_json() or {}
-    phones = (data.get("phones") or [])[:10]
-    emails = (data.get("emails") or [])[:10]
-    inns = (data.get("inns") or [])[:10]
+    phones = list((data.get("phones") or [])[:10])
+    emails = list((data.get("emails") or [])[:10])
+    inns = list((data.get("inns") or [])[:10])
     results = {"companies": [], "contacts": [], "grouped": {}}
     for p in phones:
         lk = lookup_by_phone(user["org_id"], p)
@@ -8619,29 +8734,37 @@ def api_lookup_multi():
     results["contacts"] = uniq_p
     return jsonify(ok=True, **results)
 
-
 # ----- INBOX API -----
 @app.route("/api/inbox/list", methods=["GET"])
 @_login_required
 def api_inbox_list():
     user = g.user
     org_id = user["org_id"]
-    page = max(1, int(request.args.get("page", 1)))
-    per_page = min(max(1, int(request.args.get("per_page", 50))), 100)
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(max(1, int(request.args.get("per_page", 50))), 100)
+    except Exception:
+        page, per_page = 1, 50
     offset = (page - 1) * per_page
-    status = request.args.get("status", "").strip()
-    channel = request.args.get("channel", "").strip()
-    assignee = request.args.get("assignee", "").strip()
-    who = request.args.get("who", "").strip()
+    status = (request.args.get("status") or "").strip()
+    channel = (request.args.get("channel") or "").strip()
+    assignee = (request.args.get("assignee") or "").strip()
+    who = (request.args.get("who") or "").strip()
     q = (request.args.get("q") or "").strip()
     where = ["t.org_id=?"]
     params: List[Any] = [org_id]
     if status:
         where.append("t.status=?"); params.append(status)
     if channel:
-        where.append("t.channel_id=?"); params.append(int(channel))
+        try:
+            where.append("t.channel_id=?"); params.append(int(channel))
+        except Exception:
+            pass
     if assignee:
-        where.append("t.assignee_id=?"); params.append(int(assignee))
+        try:
+            where.append("t.assignee_id=?"); params.append(int(assignee))
+        except Exception:
+            pass
     if who == "me":
         where.append("t.assignee_id=?"); params.append(user["id"])
     if q:
@@ -8651,18 +8774,17 @@ def api_inbox_list():
     total = int((total_row or {}).get("c") or 0)
     threads = query_db(
         f"""
-        SELECT t.*, c.name AS channel_name, u.username AS assignee_name
-        FROM inbox_threads t
-        LEFT JOIN channels c ON t.channel_id=c.id
-        LEFT JOIN users u ON t.assignee_id=u.id
-        WHERE {wc}
-        ORDER BY (t.last_message_at IS NULL) ASC, t.last_message_at DESC, t.created_at DESC
-        LIMIT ? OFFSET ?
-        """,
+SELECT t.*, c.name AS channel_name, u.username AS assignee_name
+FROM inbox_threads t
+LEFT JOIN channels c ON t.channel_id=c.id
+LEFT JOIN users u ON t.assignee_id=u.id
+WHERE {wc}
+ORDER BY (t.last_message_at IS NULL) ASC, t.last_message_at DESC, t.created_at DESC
+LIMIT ? OFFSET ?
+""",
         (*params, per_page, offset)
     ) or []
     return jsonify(ok=True, items=[dict(t) for t in threads], page=page, per_page=per_page, total=int(total or 0))
-
 
 @app.route("/api/thread/update", methods=["POST"])
 @_login_required
@@ -8693,7 +8815,6 @@ def api_thread_update():
             pass
     return jsonify(ok=True)
 
-
 @app.route("/api/message/send", methods=["POST"])
 @_login_required
 @_csrf_protect
@@ -8717,7 +8838,6 @@ def api_message_send():
         return jsonify(ok=False, error="Message rejected"), 400
     return jsonify(ok=True, id=int(mid))
 
-
 @app.route("/api/message/to_task", methods=["POST"])
 @_login_required
 @_csrf_protect
@@ -8730,11 +8850,11 @@ def api_message_to_task():
         return jsonify(ok=False, error="Message ID and title required"), 400
     msg = query_db(
         """
-        SELECT m.*, t.company_id, t.contact_id, t.org_id
-        FROM inbox_messages m
-        JOIN inbox_threads t ON m.thread_id=t.id
-        WHERE m.id=? AND t.org_id=?
-        """,
+SELECT m.*, t.company_id, t.contact_id, t.org_id
+FROM inbox_messages m
+JOIN inbox_threads t ON m.thread_id=t.id
+WHERE m.id=? AND t.org_id=?
+""",
         (message_id, user["org_id"]), one=True
     )
     if not msg:
@@ -8749,14 +8869,53 @@ def api_message_to_task():
         contact_id=msg.get("contact_id"),
     )
     return jsonify(ok=True, task_id=task_id)
-
-# ===== END OF CORE PART 10/10 (1/3-A) =====
-# ===== START OF CORE PART 10/10 (1/3-B) =====
-# coding: utf-8
-
+# ==================== END OF CORE PART 10/10 (1/3-A) ====================
 # ==================== CORE PART 10/10 (1/3-B) ====================
 # ===== BLOCK: API ROUTES — AI ASSISTS, COMMANDS, COLLAB, AGENTS, CHAT, BI, RAG, PAYROLL (PART B) =====
 
+# ----- Optional helpers fallbacks (only if not defined globally) -----
+if "detect_mime_from_bytes" not in globals():
+    import mimetypes
+    def detect_mime_from_bytes(data: bytes, filename: str = "") -> str:
+        # naive guess by extension first
+        if filename:
+            guess = mimetypes.guess_type(filename)[0]
+            if guess:
+                return guess
+        # simple magic fallback
+        if data.startswith(b"\xFF\xD8\xFF"):
+            return "image/jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data[:4] in (b"%PDF",):
+            return "application/pdf"
+        return "application/octet-stream"
+
+if "is_allowed_upload_type" not in globals():
+    def is_allowed_upload_type(ct: str) -> bool:
+        allowed = {
+            "image/jpeg", "image/png", "image/gif",
+            "application/pdf", "text/plain",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        }
+        return (ct or "").lower() in allowed
+
+if "store_file" not in globals():
+    def store_file(org_id: int, filename: str, data: bytes, content_type: str, uploaded_by: Optional[int]) -> dict:
+        os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
+        fid = exec_db(
+            "INSERT INTO files (org_id, storage_key, name, content_type, size_bytes, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (org_id, "", filename, content_type, len(data or b""), uploaded_by, utc_now())
+        )
+        storage_name = f"{int(fid)}{uuid.uuid4().hex}{secure_filename(filename)}"
+        path = os.path.join(LOCAL_UPLOAD_DIR, storage_name)
+        with open(path, "wb") as f:
+            f.write(data or b"")
+        exec_db_affect("UPDATE files SET storage_key=? WHERE id=?", (storage_name, int(fid or 0)))
+        return {"id": int(fid or 0), "name": filename, "url": f"/api/files/{int(fid)}/download", "content_type": content_type}
+
+# ----- FILE UPLOAD FOR INBOX MESSAGES -----
 @app.route("/api/message/upload", methods=["POST"])
 @_login_required
 @_csrf_protect
@@ -8766,17 +8925,18 @@ def api_message_upload():
     if "file" not in request.files:
         return jsonify(ok=False, error="No file"), 400
     f = request.files["file"]
-    if not f.filename:
+    if not f or not f.filename:
         return jsonify(ok=False, error="Empty filename"), 400
     data = f.read()
+    if not data:
+        return jsonify(ok=False, error="Empty file"), 400
     content_type = detect_mime_from_bytes(data, f.filename) or "application/octet-stream"
     if not is_allowed_upload_type(content_type):
         return jsonify(ok=False, error="File type not allowed"), 400
-    file_info = store_file(user["org_id"], secure_filename(f.filename), data, content_type, user["id"])
-    return jsonify(ok=True, file=file_info)
+    info = store_file(user["org_id"], secure_filename(f.filename), data, content_type, user["id"])
+    return jsonify(ok=True, file=info)
 
-
-# ----- AI ASSIST ENDPOINTS (queued or sync) -----
+# ----- AI ASSIST ENDPOINTS -----
 @app.route("/api/ai/summarize_thread", methods=["POST"])
 @_login_required
 @_csrf_protect
@@ -8784,12 +8944,13 @@ def api_message_upload():
 def api_ai_summarize_thread():
     user = g.user
     data = request.get_json() or {}
-    thread_id = data.get("thread_id")
+    thread_id = int(data.get("thread_id") or 0)
     if not thread_id:
         return jsonify(ok=False, error="thread_id required"), 400
+    # queue job
     jid = exec_db(
         "INSERT INTO ai_jobs (org_id, user_id, job_type, entity_type, entity_id, input_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user["org_id"], user["id"], "summarize", "thread", int(thread_id), "", "pending", utc_now())
+        (user["org_id"], user["id"], "summarize", "thread", thread_id, "", "pending", utc_now())
     )
     return jsonify(ok=True, job_id=int(jid or 0), status="queued")
 
@@ -8825,12 +8986,12 @@ def api_ai_draft_reply():
 def api_ai_autotag():
     user = g.user
     data = request.get_json() or {}
-    thread_id = data.get("thread_id")
+    thread_id = int(data.get("thread_id") or 0)
     if not thread_id:
         return jsonify(ok=False, error="thread_id required"), 400
     jid = exec_db(
         "INSERT INTO ai_jobs (org_id, user_id, job_type, entity_type, entity_id, input_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user["org_id"], user["id"], "autotag", "thread", int(thread_id), "", "pending", utc_now())
+        (user["org_id"], user["id"], "autotag", "thread", thread_id, "", "pending", utc_now())
     )
     return jsonify(ok=True, job_id=int(jid or 0), status="queued")
 
@@ -8846,8 +9007,7 @@ def api_ai_job_status():
         return jsonify(ok=False, error="not_found"), 404
     return jsonify(ok=True, **row)
 
-
-# ----- COMMAND PALETTE (NL intents) -----
+# ----- COMMAND PALETTE -----
 @app.route("/api/ai/command", methods=["POST"])
 @_login_required
 @_csrf_protect
@@ -8871,19 +9031,29 @@ intent, params (dict), ui_hint (короткая подсказка), requires_c
         obj = json.loads(txt) if (txt and txt.strip().startswith("{")) else {"intent": "search", "params": {"q": cmd}, "ui_hint": "Поиск", "requires_confirmation": False}
         intent = obj.get("intent", "search")
         params = obj.get("params", {})
+
         if intent == "go":
             return jsonify(ok=True, action="navigate", url=str(params.get("url", "/")))
+
         if intent == "create_task":
             title = (params.get("title") or cmd).strip()
             tid = create_task(user["org_id"], title=title, description=params.get("description", ""), assignee_id=user["id"])  # type: ignore
             return jsonify(ok=True, action="open", url=f"/task/{tid}", created_id=tid)
+
         if intent == "create_deal":
             title = (params.get("title") or cmd).strip()
-            did = create_deal(user["org_id"], title=title, amount=float(params.get("amount", 0) or 0), stage="new", assignee_id=user["id"])  # type: ignore
+            amount = 0.0
+            try:
+                amount = float(params.get("amount", 0) or 0)
+            except Exception:
+                amount = 0.0
+            did = create_deal(user["org_id"], title=title, amount=amount, stage="new", assignee_id=user["id"])  # type: ignore
             return jsonify(ok=True, action="open", url=f"/deal/{did}", created_id=did)
+
         if intent == "search":
             q = params.get("q") or cmd
             return jsonify(ok=True, action="navigate", url=f"/search?q={q}")
+
         if intent == "summarize_thread":
             thread_id = int(params.get("thread_id") or 0)
             if not thread_id:
@@ -8893,29 +9063,33 @@ intent, params (dict), ui_hint (короткая подсказка), requires_c
                 (user["org_id"], user["id"], "summarize", "thread", thread_id, "", "pending", utc_now())
             )
             return jsonify(ok=True, action="ai_job", job_id=int(jid or 0))
+
         if intent == "run_agent":
             agent_name = params.get("agent") or "sales"
             agent_ctx = params.get("context") or {}
             result = run_agent(agent_name, user["org_id"], user["id"], agent_ctx)  # type: ignore
             return jsonify(ok=True, action="agent_result", result=result)
+
         if intent == "orchestrate":
             plan = params.get("plan") or []
             orch = AgentOrchestrator(user["org_id"], user["id"], parallel=True, max_workers=4)  # type: ignore
             res = orch.run(plan, context={})
             return jsonify(ok=True, action="agent_orchestrator_result", result=res)
+
         if intent == "bi_query":
             nlq = params.get("q") or cmd
             res = conversational_bi_query(nlq, user["org_id"], user["id"])  # type: ignore
             return jsonify(ok=True, action="bi_result", result=res)
+
         if intent == "rag_answer":
             qtext = params.get("q") or cmd
             res = rag_answer(user["org_id"], qtext, entity_type=params.get("entity_type"))  # type: ignore
             return jsonify(ok=True, action="rag_result", result=res)
+
         return jsonify(ok=True, action="noop", info=obj)
     except Exception as e:
         log("ERROR", "AI command failed", error=str(e))
         return jsonify(ok=False, error="Command processing failed"), 500
-
 
 # ----- LIVE COLLABORATION -----
 @app.route("/api/collab/heartbeat", methods=["POST"])
@@ -8961,147 +9135,154 @@ def api_collab_change():
         pass
     return jsonify(ok=True)
 
-
-# ----- ZERO-CODE AGENT BUILDER API -----
+# ----- AGENTS API -----
 @app.route("/api/agents/list", methods=["GET"])
 @_login_required
 def api_agents_list():
-    user = g.user
-    rows = query_db("SELECT id, name, description, active, created_by, created_at, updated_at, graph_json FROM agent_definitions WHERE org_id=? ORDER BY created_at DESC", (user["org_id"],)) or []
-    return jsonify(ok=True, items=[dict(r) for r in rows])
+    rows = query_db(
+        "SELECT id, name, description, graph_json, active, created_by, created_at, updated_at "
+        "FROM agent_definitions WHERE org_id=? ORDER BY updated_at DESC NULLS LAST, created_at DESC",
+        (g.user["org_id"],)
+    ) or []
+    return jsonify(ok=True, items=rows)
 
 @app.route("/api/agent/definition/save", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_agent_definition_save():
-    user = g.user
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
-    description = (data.get("description") or "").strip()
-    graph = data.get("graph") or {}
+    if not name:
+        return jsonify(ok=False, error="name required"), 400
+    desc = (data.get("description") or "").strip()
     active = bool(data.get("active", True))
-    if not name or not isinstance(graph, dict):
-        return jsonify(ok=False, error="Invalid payload"), 400
-    existing = query_db("SELECT id FROM agent_definitions WHERE org_id=? AND name=?", (user["org_id"], name), one=True)
-    with db_transaction():
+    graph = data.get("graph") or data.get("definition") or {}
+    try:
+        existing = query_db("SELECT id FROM agent_definitions WHERE org_id=? AND name=?", (g.user["org_id"], name), one=True)
         if existing:
-            exec_db_affect("UPDATE agent_definitions SET description=?, graph_json=?, active=?, updated_at=? WHERE id=?",
-                           (description, json.dumps(graph, ensure_ascii=False), 1 if active else 0, utc_now(), existing["id"]))
-            aid = existing["id"]
+            exec_db_affect(
+                "UPDATE agent_definitions SET description=?, graph_json=?, active=?, updated_at=? WHERE id=?",
+                (desc, json.dumps(graph, ensure_ascii=False), int(active), utc_now(), int(existing["id"]))
+            )
+            aid = int(existing["id"])
         else:
-            aid = exec_db("INSERT INTO agent_definitions (org_id, name, description, graph_json, active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                          (user["org_id"], name, description, json.dumps(graph, ensure_ascii=False), 1 if active else 0, user["id"], utc_now(), utc_now()))
-        try:
-            add_audit(user["org_id"], user["id"], "agent.definition_saved", "agent_definition", int(aid or 0), {"name": name})  # type: ignore
-        except Exception:
-            pass
-    return jsonify(ok=True, id=int(aid or 0))
+            aid = exec_db(
+                "INSERT INTO agent_definitions (org_id, name, description, graph_json, active, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (g.user["org_id"], name, desc, json.dumps(graph, ensure_ascii=False), int(active), g.user["id"], utc_now(), utc_now())
+            )
+        return jsonify(ok=True, id=int(aid or 0))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/api/agent/run", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_agent_run():
-    user = g.user
     data = request.get_json() or {}
-    agent_name = (data.get("agent") or "").strip()
-    context = data.get("context") or {}
-    if not agent_name:
-        return jsonify(ok=False, error="agent required"), 400
-    # Built-ins first
-    if get_agent(agent_name, user["org_id"], user["id"]):  # type: ignore
-        res = run_agent(agent_name, user["org_id"], user["id"], context)  # type: ignore
-        return jsonify(ok=True, result=res)
-    row = query_db("SELECT id, graph_json FROM agent_definitions WHERE org_id=? AND name=? AND active=1", (user["org_id"], agent_name), one=True)
-    if not row:
-        return jsonify(ok=False, error="agent not found"), 404
+    agent = (data.get("agent") or data.get("name") or "").strip()
+    ctx = data.get("context") or {}
     try:
-        definition = json.loads(row["graph_json"])
-    except Exception:
-        definition = {}
-    runner = CustomAgentRunner(definition)
-    ctx = {"org_id": user["org_id"], "user_id": user["id"], **(context or {})}
-    res = runner.execute(ctx)
-    return jsonify(ok=True, result=res)
+        ag = get_agent(agent, g.user["org_id"], g.user["id"])
+        if not ag:
+            return jsonify(ok=False, error="unknown_agent"), 404
+        res = ag.execute(ctx)
+        return jsonify(ok=True, result=res)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/api/agent/test", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_agent_test():
-    user = g.user
     data = request.get_json() or {}
-    definition = data.get("definition") or {}
-    if not isinstance(definition, dict):
-        return jsonify(ok=False, error="definition must be dict"), 400
-    runner = CustomAgentRunner(definition)
-    ctx = {"org_id": user["org_id"], "user_id": user["id"], **(data.get("context") or {})}
-    res = runner.execute(ctx)
-    return jsonify(ok=True, result=res)
+    definition = data.get("definition") or data.get("graph") or {}
+    context = data.get("context") or {"org_id": g.user["org_id"], "user_id": g.user["id"]}
+    try:
+        runner = CustomAgentRunner(definition)
+        res = runner.execute(context)
+        return jsonify(ok=True, result=res)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/api/agents/orchestrate", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_agents_orchestrate():
-    user = g.user
     data = request.get_json() or {}
     plan = data.get("plan") or []
-    orch = AgentOrchestrator(user["org_id"], user["id"], parallel=True, max_workers=4)
-    res = orch.run(plan, context=data.get("context") or {})
-    return jsonify(ok=True, result=res)
+    ctx = data.get("context") or {}
+    parallel = bool(data.get("parallel", False))
+    max_workers = int(data.get("max_workers", 4))
+    try:
+        orch = AgentOrchestrator(g.user["org_id"], g.user["id"], parallel=parallel, max_workers=max_workers)
+        res = orch.run(plan, ctx)
+        return jsonify(ok=True, result=res)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
-
-# ----- CHAT MINIMAL API -----
+# ----- CHAT API -----
 @app.route("/api/chat/create", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_chat_create():
-    user = g.user
     data = request.get_json() or {}
-    ctype = (data.get("type") or "public").strip()
-    title = data.get("title", "").strip()
-    members = data.get("members", []) or []
-    dept_ids = data.get("department_ids", []) or []
-    channel_id = exec_db("INSERT INTO chat_channels (org_id, type, title, created_at) VALUES (?, ?, ?, ?)",
-                         (user["org_id"], ctype, title, utc_now()))
-    for uid in members:
-        u = query_db("SELECT id FROM users WHERE id=? AND org_id=? AND active=1", (uid, user["org_id"]), one=True)
-        if u:
-            exec_db("INSERT INTO chat_members (channel_id, user_id, created_at) VALUES (?, ?, ?)", (channel_id, uid, utc_now()))
-    for did in dept_ids:
-        exec_db("INSERT INTO chat_members (channel_id, department_id, created_at) VALUES (?, ?, ?)", (channel_id, did, utc_now()))
+    title = (data.get("title") or "").strip()
+    ch_type = (data.get("type") or "public").strip()
+    members = data.get("members") or []
+    dept_ids = data.get("department_ids") or []
+    if not title:
+        return jsonify(ok=False, error="title required"), 400
     try:
-        add_audit(user["org_id"], user["id"], "chat.channel_created", "chat_channel", int(channel_id or 0), {"title": title})  # type: ignore
-    except Exception:
-        pass
-    return jsonify(ok=True, id=int(channel_id or 0))
+        cid = exec_db(
+            "INSERT INTO chat_channels (org_id, type, title, created_at) VALUES (?, ?, ?, ?)",
+            (g.user["org_id"], ch_type, title, utc_now())
+        )
+        for uid in members:
+            try:
+                uid_i = int(uid)
+                u = query_db("SELECT id FROM users WHERE id=? AND org_id=? AND active=1", (uid_i, g.user["org_id"]), one=True)
+                if u:
+                    exec_db("INSERT INTO chat_members (channel_id, user_id, created_at) VALUES (?, ?, ?)", (int(cid or 0), uid_i, utc_now()))
+            except Exception:
+                pass
+        for did in dept_ids:
+            try:
+                did_i = int(did)
+                exec_db("INSERT INTO chat_members (channel_id, department_id, created_at) VALUES (?, ?, ?)", (int(cid or 0), did_i, utc_now()))
+            except Exception:
+                pass
+        return jsonify(ok=True, id=int(cid or 0))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/api/chat/send", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_chat_send():
-    user = g.user
     data = request.get_json() or {}
-    channel_id = data.get("channel_id")
+    ch_id = int(data.get("channel_id") or 0)
     body = (data.get("body") or "").strip()
-    if not channel_id or not body:
-        return jsonify(ok=False, error="Channel ID and body required"), 400
+    if not ch_id or not body:
+        return jsonify(ok=False, error="channel_id and body required"), 400
+    # ensure channel belongs to org and user can post
     ch = query_db(
         """
-        SELECT c.* FROM chat_channels c
-        LEFT JOIN chat_members m ON c.id=m.channel_id AND m.user_id=?
-        LEFT JOIN chat_members dm ON c.id=dm.channel_id AND dm.department_id=(SELECT department_id FROM users WHERE id=?)
-        WHERE c.id=? AND c.org_id=? AND (c.type='public' OR m.user_id IS NOT NULL OR dm.department_id IS NOT NULL)
-        """,
-        (user["id"], user["id"], channel_id, user["org_id"]), one=True
+SELECT c.* FROM chat_channels c
+LEFT JOIN chat_members m ON c.id=m.channel_id AND m.user_id=?
+LEFT JOIN chat_members dm ON c.id=dm.channel_id AND dm.department_id=(SELECT department_id FROM users WHERE id=?)
+WHERE c.id=? AND c.org_id=? AND (c.type='public' OR m.user_id IS NOT NULL OR dm.department_id IS NOT NULL)
+""",
+        (g.user["id"], g.user["id"], ch_id, g.user["org_id"]), one=True
     )
     if not ch:
         return jsonify(ok=False, error="Channel not found or access denied"), 403
-    msg_id = exec_db("INSERT INTO chat_messages (channel_id, user_id, body, created_at) VALUES (?, ?, ?, ?)", (int(channel_id), user["id"], body, utc_now()))
+    msg_id = exec_db("INSERT INTO chat_messages (channel_id, user_id, body, created_at) VALUES (?, ?, ?, ?)", (ch_id, g.user["id"], body, utc_now()))
     try:
-        members = query_db("SELECT DISTINCT user_id FROM chat_members WHERE channel_id=? AND user_id IS NOT NULL", (channel_id,)) or []
+        members = query_db("SELECT DISTINCT user_id FROM chat_members WHERE channel_id=? AND user_id IS NOT NULL", (ch_id,)) or []
         for m in members:
             if m.get("user_id"):
-                sse_push(int(m["user_id"]), "chat.message", {"channel_id": int(channel_id), "by": user["id"]})
-        add_audit(user["org_id"], user["id"], "chat.message_sent", "chat_channel", int(channel_id), {})  # type: ignore
+                sse_push(int(m["user_id"]), "chat.message", {"channel_id": ch_id, "by": g.user["id"]})
     except Exception:
         pass
     return jsonify(ok=True, id=int(msg_id or 0))
@@ -9110,18 +9291,17 @@ def api_chat_send():
 @_login_required
 @_csrf_protect
 def api_chat_upload():
-    user = g.user
-    channel_id = request.form.get("channel_id")
-    if not channel_id or "file" not in request.files:
-        return jsonify(ok=False, error="Channel ID and file required"), 400
+    ch_id = int(request.form.get("channel_id") or 0)
+    if not ch_id or "file" not in request.files:
+        return jsonify(ok=False, error="channel_id and file required"), 400
     ch = query_db(
         """
-        SELECT c.* FROM chat_channels c
-        LEFT JOIN chat_members m ON c.id=m.channel_id AND m.user_id=?
-        LEFT JOIN chat_members dm ON c.id=dm.channel_id AND dm.department_id=(SELECT department_id FROM users WHERE id=?)
-        WHERE c.id=? AND c.org_id=? AND (c.type='public' OR m.user_id IS NOT NULL OR dm.department_id IS NOT NULL)
-        """,
-        (user["id"], user["id"], channel_id, user["org_id"]), one=True
+SELECT c.* FROM chat_channels c
+LEFT JOIN chat_members m ON c.id=m.channel_id AND m.user_id=?
+LEFT JOIN chat_members dm ON c.id=dm.channel_id AND dm.department_id=(SELECT department_id FROM users WHERE id=?)
+WHERE c.id=? AND c.org_id=? AND (c.type='public' OR m.user_id IS NOT NULL OR dm.department_id IS NOT NULL)
+""",
+        (g.user["id"], g.user["id"], ch_id, g.user["org_id"]), one=True
     )
     if not ch:
         return jsonify(ok=False, error="Channel not found or access denied"), 403
@@ -9130,86 +9310,72 @@ def api_chat_upload():
     content_type = detect_mime_from_bytes(data, f.filename) or "application/octet-stream"
     if not is_allowed_upload_type(content_type):
         return jsonify(ok=False, error="File type not allowed"), 400
-    file_info = store_file(user["org_id"], secure_filename(f.filename), data, content_type, user["id"])
+    info = store_file(g.user["org_id"], secure_filename(f.filename), data, content_type, g.user["id"])
     exec_db("INSERT INTO chat_messages (channel_id, user_id, body, created_at) VALUES (?, ?, ?, ?)",
-            (int(channel_id), user["id"], f"📎 {file_info['name']} ({file_info['url']})", utc_now()))
-    try:
-        add_audit(user["org_id"], user["id"], "chat.file_uploaded", "chat_channel", int(channel_id), {"file_id": file_info["id"]})  # type: ignore
-    except Exception:
-        pass
-    return jsonify(ok=True, file_id=file_info["id"], url=file_info["url"])
+            (ch_id, g.user["id"], f"📎 {info['name']} ({info['url']})", utc_now()))
+    return jsonify(ok=True, file_id=info["id"], url=info["url"])
 
 @app.route("/api/chat/add_department", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_chat_add_department():
-    user = g.user
     data = request.get_json() or {}
-    channel_id = int(data.get("channel_id") or 0)
-    department_id = int(data.get("department_id") or 0)
-    if not channel_id or not department_id:
+    ch_id = int(data.get("channel_id") or 0)
+    dept_id = int(data.get("department_id") or 0)
+    if not ch_id or not dept_id:
         return jsonify(ok=False, error="channel_id and department_id required"), 400
-    ch = query_db("SELECT id FROM chat_channels WHERE id=? AND org_id=?", (channel_id, user["org_id"]), one=True)
-    dep = query_db("SELECT id FROM departments WHERE id=? AND org_id=?", (department_id, user["org_id"]), one=True)
+    ch = query_db("SELECT id FROM chat_channels WHERE id=? AND org_id=?", (ch_id, g.user["org_id"]), one=True)
+    dep = query_db("SELECT id FROM departments WHERE id=? AND org_id=?", (dept_id, g.user["org_id"]), one=True)
     if not ch or not dep:
         return jsonify(ok=False, error="Not found"), 404
-    exec_db("INSERT INTO chat_members (channel_id, department_id, created_at) VALUES (?, ?, ?)", (channel_id, department_id, utc_now()))
-    try:
-        add_audit(user["org_id"], user["id"], "chat.department_added", "chat_channel", int(channel_id), {"department_id": department_id})  # type: ignore
-    except Exception:
-        pass
+    exec_db("INSERT INTO chat_members (channel_id, department_id, created_at) VALUES (?, ?, ?)", (ch_id, dept_id, utc_now()))
     return jsonify(ok=True)
 
-
-# ----- Conversational BI (NLQ -> placeholder) -----
+# ----- Conversational BI -----
 @app.route("/api/bi/query", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_bi_query():
-    user = g.user
     data = request.get_json() or {}
-    nlq = (data.get("q") or "").strip()
-    if not nlq:
+    qtext = (data.get("q") or data.get("query") or "").strip()
+    if not qtext:
         return jsonify(ok=False, error="q required"), 400
-    res = conversational_bi_query(nlq, user["org_id"], user["id"])  # type: ignore
+    res = conversational_bi_query(qtext, g.user["org_id"], g.user["id"])  # type: ignore
     return jsonify(ok=True, result=res)
-
 
 # ----- RAG endpoints -----
 @app.route("/api/rag/index", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_rag_index():
-    user = g.user
     data = request.get_json() or {}
     entity_type = (data.get("entity_type") or "").strip()
     entity_id = int(data.get("entity_id") or 0)
     text = (data.get("text") or "").strip()
     if not entity_type or not entity_id or not text:
         return jsonify(ok=False, error="entity_type, entity_id, text required"), 400
-    rag_index_text(user["org_id"], entity_type, entity_id, text)  # type: ignore
+    rag_index_text(g.user["org_id"], entity_type, entity_id, text)  # type: ignore
     return jsonify(ok=True)
 
 @app.route("/api/rag/answer", methods=["POST"])
 @_login_required
 @_csrf_protect
 def api_rag_answer():
-    user = g.user
     data = request.get_json() or {}
     qtext = (data.get("q") or "").strip()
     if not qtext:
         return jsonify(ok=False, error="q required"), 400
-    res = rag_answer(user["org_id"], qtext, entity_type=data.get("entity_type"))  # type: ignore
+    res = rag_answer(g.user["org_id"], qtext, entity_type=data.get("entity_type"))  # type: ignore
     return jsonify(ok=True, result=res)
 
-
-# ----- PAYROLL API -----
+# ----- PAYROLL API (минимально необходимый набор) -----
 @app.route("/api/payroll/plan/list", methods=["GET"])
 @_login_required
-@_require_role("admin")
 def api_payroll_plan_list():
-    user = g.user
-    rows = query_db("SELECT * FROM payroll_plans WHERE org_id=? ORDER BY created_at DESC", (user["org_id"],)) or []
+    rows = query_db(
+        "SELECT id, name, description, config_json, active, created_at, updated_at FROM payroll_plans WHERE org_id=? ORDER BY created_at DESC",
+        (g.user["org_id"],)
+    ) or []
     return jsonify(ok=True, items=rows)
 
 @app.route("/api/payroll/plan/upsert", methods=["POST"])
@@ -9217,30 +9383,28 @@ def api_payroll_plan_list():
 @_csrf_protect
 @_require_role("admin")
 def api_payroll_plan_upsert():
-    user = g.user
     data = request.get_json() or {}
-    pid = int(data.get("id") or 0)
     name = (data.get("name") or "").strip()
-    cfg = data.get("config") or {}
-    desc = (data.get("description") or "").strip()
-    active = 1 if bool(data.get("active", True)) else 0
     if not name:
         return jsonify(ok=False, error="name required"), 400
-    if pid:
-        exec_db_affect("UPDATE payroll_plans SET name=?, description=?, config_json=?, active=?, updated_at=? WHERE id=? AND org_id=?",
-                       (name, desc, json.dumps(cfg, ensure_ascii=False), active, utc_now(), pid, user["org_id"]))
-        rid = pid
+    cfg = data.get("config") or data.get("config_json") or {}
+    desc = (data.get("description") or "").strip()
+    active = bool(data.get("active", True))
+    ex = query_db("SELECT id FROM payroll_plans WHERE org_id=? AND name=?", (g.user["org_id"], name), one=True)
+    if ex:
+        exec_db_affect("UPDATE payroll_plans SET description=?, config_json=?, active=?, updated_at=? WHERE id=?",
+                       (desc, json.dumps(cfg, ensure_ascii=False), int(active), utc_now(), int(ex["id"])))
+        pid = int(ex["id"])
     else:
-        rid = exec_db("INSERT INTO payroll_plans (org_id, name, description, config_json, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                      (user["org_id"], name, desc, json.dumps(cfg, ensure_ascii=False), active, utc_now()))
-    return jsonify(ok=True, id=int(rid or 0))
+        pid = exec_db("INSERT INTO payroll_plans (org_id, name, description, config_json, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (g.user["org_id"], name, desc, json.dumps(cfg, ensure_ascii=False), int(active), utc_now(), utc_now()))
+    return jsonify(ok=True, id=int(pid or 0))
 
 @app.route("/api/payroll/assign/upsert", methods=["POST"])
 @_login_required
 @_csrf_protect
 @_require_role("admin")
 def api_payroll_assign_upsert():
-    user = g.user
     data = request.get_json() or {}
     uid = int(data.get("user_id") or 0)
     plan_id = int(data.get("plan_id") or 0)
@@ -9251,7 +9415,7 @@ def api_payroll_assign_upsert():
     if not (uid and plan_id and eff_from):
         return jsonify(ok=False, error="user_id, plan_id, effective_from required"), 400
     rid = exec_db("INSERT INTO payroll_assignments (org_id, user_id, plan_id, effective_from, effective_to, quota_number, team_leader, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (user["org_id"], uid, plan_id, eff_from, eff_to, quota, leader, utc_now()))
+                  (g.user["org_id"], uid, plan_id, eff_from, eff_to, quota, leader, utc_now()))
     return jsonify(ok=True, id=int(rid or 0))
 
 @app.route("/api/payroll/period/ensure", methods=["POST"])
@@ -9259,14 +9423,13 @@ def api_payroll_assign_upsert():
 @_csrf_protect
 @_require_role("admin")
 def api_payroll_period_ensure():
-    user = g.user
     data = request.get_json() or {}
     period_key = (data.get("period_key") or "").strip()
     date_start = ensure_iso_datetime(data.get("date_start") or "")
     date_end = ensure_iso_datetime(data.get("date_end") or "")
     if not (period_key and date_start and date_end):
         return jsonify(ok=False, error="period_key, date_start, date_end required"), 400
-    pid = payroll_ensure_period(user["org_id"], period_key, date_start, date_end)
+    pid = payroll_ensure_period(g.user["org_id"], period_key, date_start, date_end)
     return jsonify(ok=True, period_id=int(pid or 0))
 
 @app.route("/api/payroll/period/recalc", methods=["POST"])
@@ -9274,12 +9437,11 @@ def api_payroll_period_ensure():
 @_csrf_protect
 @_require_role("admin")
 def api_payroll_period_recalc():
-    user = g.user
     data = request.get_json() or {}
     period_key = (data.get("period_key") or "").strip()
     if not period_key:
         return jsonify(ok=False, error="period_key required"), 400
-    res = payroll_recalculate_period(user["org_id"], period_key)
+    res = payroll_recalculate_period(g.user["org_id"], period_key)
     return jsonify(res if isinstance(res, dict) else {"ok": False, "error": "calc_error"})
 
 @app.route("/api/payroll/period/lock", methods=["POST"])
@@ -9287,43 +9449,91 @@ def api_payroll_period_recalc():
 @_csrf_protect
 @_require_role("admin")
 def api_payroll_period_lock():
-    user = g.user
     data = request.get_json() or {}
     period_key = (data.get("period_key") or "").strip()
     lock = bool(data.get("lock", True))
     if not period_key:
         return jsonify(ok=False, error="period_key required"), 400
-    ok = payroll_lock_period(user["org_id"], period_key, lock=lock)
+    ok = payroll_lock_period(g.user["org_id"], period_key, lock=lock)
     return jsonify(ok=bool(ok))
 
 @app.route("/api/payroll/user/summary", methods=["GET"])
 @_login_required
 def api_payroll_user_summary():
-    user = g.user
     period_key = (request.args.get("period_key") or "").strip()
-    uid = int(request.args.get("user_id") or user["id"])
+    uid = int(request.args.get("user_id") or g.user["id"])
     if not period_key:
         return jsonify(ok=False, error="period_key required"), 400
-    res = payroll_user_summary(user["org_id"], uid, period_key)
+    res = payroll_user_summary(g.user["org_id"], uid, period_key)
     return jsonify(res if isinstance(res, dict) else {"ok": False, "error": "summary_error"})
-# ===== END OF CORE PART 10/10 (1/3-B) =====
-# ===== START OF CORE PART 10/10 (2/3) =====
-# coding: utf-8
-
+# ==================== END OF CORE PART 10/10 (1/3-B) ====================
 # ==================== CORE PART 10/10 (2/3) ====================
-# ===== BLOCK: API ROUTES — CTI/CALLS, EXPORTS, OPENAPI (SECURE/OPTIMIZED) =====
+# ===== BLOCK: SSE STREAM ENDPOINT =====
+@app.route("/sse")
+@_login_required
+def sse_stream():
+    """
+    Server-Sent Events stream:
+    - ограничение на число подключений на пользователя (SSE_MAX_CONN_PER_USER),
+    - heartbeat каждые ~25 секунд,
+    - корректная отписка и очистка очереди при разрыве.
+    """
+    if not SSE_ENABLED:
+        return Response("SSE disabled", status=503)
+    user = g.user
+    uid = int(user["id"])
+    q = Queue(maxsize=100)
 
-# --- CTI helpers ---
+    with _sse_lock:
+        lst = _sse_queues.setdefault(uid, [])
+        if len(lst) >= SSE_MAX_CONN_PER_USER:
+            return Response("Too many SSE connections", status=429)
+        lst.append(q)
+
+    @stream_with_context
+    def _gen():
+        # initial heartbeat сразу после подключения
+        yield "event: ping\ndata: {}\n\n"
+        try:
+            while not _shutdown_event.is_set():
+                try:
+                    item = q.get(timeout=25)
+                    ev = item.get("event") or "message"
+                    data = json.dumps(item.get("data") or {}, ensure_ascii=False)
+                    yield f"event: {ev}\ndata: {data}\n\n"
+                except Empty:
+                    # keep-alive
+                    yield "event: ping\ndata: {}\n\n"
+        finally:
+            try:
+                with _sse_lock:
+                    lst = _sse_queues.get(uid, [])
+                    if q in lst:
+                        lst.remove(q)
+                    if not lst:
+                        _sse_queues.pop(uid, None)
+            except Exception:
+                pass
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive"
+    }
+    return Response(_gen(), mimetype="text/event-stream", headers=headers)
+
+# ===== BLOCK: API ROUTES — CTI/CALLS, EXPORTS, OPENAPI (SECURE/OPTIMIZED) =====
+# --- Phone extract (fixed RU regex) ---
 def extract_phones_from_text(text: str) -> List[str]:
     """
-    Extract phones in E.164-like and Russian formats; normalized to +7... where applicable.
+    Extract phones in E.164-like and common Russian formats; normalized to +7... where applicable.
     """
     if not text:
         return []
-    # International: +XXXXXXXXXXX with separators/spaces
-    intl_re = re.compile(r"(?:\+?\d[\d\-\s]{9,}\d)")
-    # RU: +7/8 (optional spaces/dashes, optional parentheses): 8 (XXX) XXX-XX-XX
-    ru_re = re.compile(r"(?:\+?7|8)[\s\-]?KATEX_INLINE_OPEN?\d{3}KATEX_INLINE_CLOSE?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
+    # International: +xxxxxxxx with separators/spaces/parentheses
+    intl_re = re.compile(r"(?:\+?\d[\d\-\s\(\)]{9,}\d)")
+    # RU: +7/8 (spaces/dashes/parentheses allowed), e.g. +7 (XXX) XXX-XX-XX or 8XXXXXXXXXX
+    ru_re = re.compile(r"(?:\+?7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
     phones: List[str] = []
     for pat in (intl_re, ru_re):
         for m in pat.findall(text or ""):
@@ -9332,7 +9542,7 @@ def extract_phones_from_text(text: str) -> List[str]:
                 phones.append(norm)
     return phones
 
-# SSRF-safe HTTP fetch for recordings
+# --- SSRF-safe helpers for recordings fetch ---
 def _resolve_all_ips(hostname: str) -> List[str]:
     try:
         res = socket.getaddrinfo(hostname, None)
@@ -9372,6 +9582,12 @@ def validate_public_url(url: str) -> bool:
 
 def http_stream_safe(url: str, timeout: int = 15, headers: Optional[dict] = None,
                      max_bytes: int = 100 * 1024 * 1024, allow_redirects: bool = False, max_redirects: int = 5):
+    """
+    SSRF‑safe HTTP streaming:
+    - проверка URL/хоста на публичность (не приватные адреса),
+    - контроль редиректов,
+    - ограничение объема.
+    """
     def _one(u):
         if not validate_public_url(u):
             raise ValueError("Untrusted URL")
@@ -9427,8 +9643,8 @@ def cti_provider_webhook(provider_name: str):
     """
     Normalizes incoming CTI payload and records call start/end.
     Security:
-      - Channel selected by X-CTI-Channel (ID).
-      - Signature X-CTI-Signature: HMAC-SHA256 over raw JSON body with channel.secret.
+    - Channel selected by X-CTI-Channel (ID).
+    - Signature X-CTI-Signature: HMAC-SHA256 over raw JSON body with channel.secret.
     """
     try:
         raw_body = request.get_data() or b""
@@ -9485,8 +9701,8 @@ def _handle_call_incoming(org_id: int, channel_id: int, data: dict):
     company_id = lk["companies"][0]["id"] if lk["companies"] else None
     contact_id = lk["contacts"][0]["id"] if lk["contacts"] else None
     call_id = exec_db(
-        "INSERT INTO calls (org_id, channel_id, external_call_id, direction, from_e164, to_e164, company_id, contact_id, status, started_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (org_id, channel_id, call_id_external, "inbound", from_number, to_number, company_id, contact_id, "ringing", utc_now(), utc_now())
+        "INSERT INTO calls (org_id, channel_id, external_call_id, direction, from_e164, to_e164, agent_id, company_id, contact_id, status, started_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (org_id, channel_id, call_id_external, "inbound", from_number, to_number, None, company_id, contact_id, "ringing", utc_now(), utc_now())
     )
     agents = query_db("SELECT id FROM users WHERE org_id=? AND active=1", (org_id,)) or []
     for a in agents:
@@ -9502,7 +9718,6 @@ def _handle_call_ended(org_id: int, channel_id: int, data: dict):
     if not call:
         return
     exec_db("UPDATE calls SET status='completed', duration_sec=?, ended_at=? WHERE id=?", (duration_sec, utc_now(), call["id"]))
-
 
 # ----- Calls API -----
 @app.route("/api/calls/list", methods=["GET"])
@@ -9534,15 +9749,15 @@ def api_calls_list():
     total = int((total_row or {}).get("c") or 0)
     calls = query_db(
         f"""
-        SELECT c.*, u.username AS agent_name, comp.name AS company_name, cont.name AS contact_name
-        FROM calls c
-        LEFT JOIN users u ON c.agent_id=u.id
-        LEFT JOIN companies comp ON c.company_id=comp.id
-        LEFT JOIN contacts cont ON c.contact_id=cont.id
-        WHERE {wc}
-        ORDER BY c.started_at DESC
-        LIMIT ? OFFSET ?
-        """,
+SELECT c.*, u.username AS agent_name, comp.name AS company_name, cont.name AS contact_name
+FROM calls c
+LEFT JOIN users u ON c.agent_id=u.id
+LEFT JOIN companies comp ON c.company_id=comp.id
+LEFT JOIN contacts cont ON c.contact_id=cont.id
+WHERE {wc}
+ORDER BY c.started_at DESC
+LIMIT ? OFFSET ?
+""",
         (*params, per_page, offset)
     ) or []
     return jsonify(ok=True, items=[dict(c) for c in calls], page=page, per_page=per_page, total=int(total or 0))
@@ -9586,13 +9801,12 @@ def cti_recording(rec_id: int):
         def gen():
             for chunk in http_stream_safe(rec_url, timeout=20, allow_redirects=True):
                 yield chunk
-        return Response(gen(), mimetype="audio/mpeg", headers={"Content-Disposition": f'attachment; filename="recording{rec_id}.mp3"'})
+        return Response(gen(), mimetype="audio/mpeg", headers={"Content-Disposition": f'attachment; filename=\"recording{rec_id}.mp3\""})
     except Exception as e:
         log("ERROR", "Recording fetch failed", error=str(e))
         return jsonify(ok=False, error="Failed to fetch recording"), 500
 
-
-# ---- Exports (CSV with injection protection) ----
+# ---- Exports (CSV with injection protection + ETag) ----
 def _csv_safe_cell(val: Any) -> Any:
     """Prevent CSV formula injection by prefixing dangerous leading chars with apostrophe."""
     if val is None:
@@ -9716,7 +9930,6 @@ def export_deals_csv():
     resp.headers["ETag"] = etag
     return resp
 
-
 # ----- OpenAPI minimal (aligned to actual routes) -----
 @app.route("/api/openapi.json", methods=["GET"])
 def api_openapi():
@@ -9741,75 +9954,74 @@ def api_openapi():
     }
     return jsonify(spec)
 
-# ===== END OF CORE PART 10/10 (2/3) =====
-# ===== START OF CORE PART 10/10 (3/3) =====
-# coding: utf-8
-
+# ==================== END OF CORE PART 10/10 (2/3) ====================
 # ==================== CORE PART 10/10 (3/3) ====================
-# ===== BLOCK: WORKERS =====
-_workers_started = False
+# ===== BLOCK: WORKERS (DLQ, EXECUTORS, SCHEDULERS) =====
+# Workers globals
 _workers_lock = threading.Lock()
-_workers_last_tick = {"webhook": 0.0, "maintenance": 0.0, "calendar_reminders": 0.0}
-_DLQ_READY = False
+_workers_started = False
+_workers_last_tick: Dict[str, float] = {"webhook": 0.0, "maintenance": 0.0, "calendar_reminders": 0.0}
 
+# DLQ ensure
+_DLQ_READY = False
 def _ensure_dlq_tables():
-    """Create DLQ tables for webhook and ai_jobs once."""
+    """Create DLQ tables for webhook and ai_jobs if not exists (idempotent)."""
     global _DLQ_READY
     if _DLQ_READY:
         return
     try:
         if DIALECT == "postgres":
             exec_db("""
-            CREATE TABLE IF NOT EXISTS webhook_dlq (
-                id INTEGER PRIMARY KEY,
-                webhook_id INTEGER,
-                event TEXT,
-                payload_json TEXT,
-                last_error TEXT,
-                attempts INTEGER,
-                dead_at TIMESTAMP WITHOUT TIME ZONE
-            )
-            """, ())
+CREATE TABLE IF NOT EXISTS webhook_dlq (
+    id INTEGER PRIMARY KEY,
+    webhook_id INTEGER,
+    event TEXT,
+    payload_json TEXT,
+    last_error TEXT,
+    attempts INTEGER,
+    dead_at TIMESTAMP WITHOUT TIME ZONE
+)
+""", ())
             exec_db("""
-            CREATE TABLE IF NOT EXISTS ai_jobs_dlq (
-                id INTEGER PRIMARY KEY,
-                org_id INTEGER,
-                user_id INTEGER,
-                job_type TEXT,
-                entity_type TEXT,
-                entity_id INTEGER,
-                input_text TEXT,
-                error TEXT,
-                attempts INTEGER,
-                dead_at TIMESTAMP WITHOUT TIME ZONE
-            )
-            """, ())
+CREATE TABLE IF NOT EXISTS ai_jobs_dlq (
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER,
+    user_id INTEGER,
+    job_type TEXT,
+    entity_type TEXT,
+    entity_id INTEGER,
+    input_text TEXT,
+    error TEXT,
+    attempts INTEGER,
+    dead_at TIMESTAMP WITHOUT TIME ZONE
+)
+""", ())
         else:
             exec_db("""
-            CREATE TABLE IF NOT EXISTS webhook_dlq (
-                id INTEGER PRIMARY KEY,
-                webhook_id INTEGER,
-                event TEXT,
-                payload_json TEXT,
-                last_error TEXT,
-                attempts INTEGER,
-                dead_at TEXT
-            )
-            """, ())
+CREATE TABLE IF NOT EXISTS webhook_dlq (
+    id INTEGER PRIMARY KEY,
+    webhook_id INTEGER,
+    event TEXT,
+    payload_json TEXT,
+    last_error TEXT,
+    attempts INTEGER,
+    dead_at TEXT
+)
+""", ())
             exec_db("""
-            CREATE TABLE IF NOT EXISTS ai_jobs_dlq (
-                id INTEGER PRIMARY KEY,
-                org_id INTEGER,
-                user_id INTEGER,
-                job_type TEXT,
-                entity_type TEXT,
-                entity_id INTEGER,
-                input_text TEXT,
-                error TEXT,
-                attempts INTEGER,
-                dead_at TEXT
-            )
-            """, ())
+CREATE TABLE IF NOT EXISTS ai_jobs_dlq (
+    id INTEGER PRIMARY KEY,
+    org_id INTEGER,
+    user_id INTEGER,
+    job_type TEXT,
+    entity_type TEXT,
+    entity_id INTEGER,
+    input_text TEXT,
+    error TEXT,
+    attempts INTEGER,
+    dead_at TEXT
+)
+""", ())
         _DLQ_READY = True
     except Exception as e:
         log("WARN", "DLQ tables ensure failed", error=str(e))
@@ -9872,6 +10084,7 @@ def _webhook_deliver_once():
                 exec_db("UPDATE webhook_queue SET attempts=?, next_try_at=?, last_error=? WHERE id=?", (attempts, next_try, str(e)[:500], t["id"]))
 
 def _email_sequence_worker():
+    """Send next step emails for active enrollments when due (best-effort)."""
     rows = query_db(
         "SELECT e.id, e.email, e.sequence_id, e.current_step, e.last_sent_at, s.step_num, s.delay_hours, s.subject, s.body_template "
         "FROM sequence_enrollments e "
@@ -9895,6 +10108,7 @@ def _email_sequence_worker():
             log("WARN", "email sequence send failed", error=str(e))
 
 def _ai_job_process_pending():
+    """Process queued AI jobs with error handling and DLQ after max attempts."""
     _ensure_dlq_tables()
     jobs = query_db("SELECT * FROM ai_jobs WHERE status='pending' ORDER BY id ASC LIMIT 5") or []
     for j in jobs:
@@ -9931,6 +10145,7 @@ def _ai_job_process_pending():
                 exec_db("UPDATE ai_jobs SET status='failed', error=?, attempts=? WHERE id=?", (str(e)[:500], attempts, j["id"]))
 
 def _wf_execute_once():
+    """Minimal workflow executor placeholder (idempotent switch to processing then to completed)."""
     rows = query_db("SELECT * FROM workflow_tasks WHERE status='pending' AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY id ASC LIMIT 10", (utc_now(),)) or []
     for t in rows:
         try:
@@ -9943,6 +10158,7 @@ def _wf_execute_once():
             exec_db("UPDATE workflow_tasks SET status='failed', error=?, completed_at=? WHERE id=?", (str(e)[:500], utc_now(), t["id"]))
 
 def _process_task_reminders():
+    """Push reminders to assignees (SSE + optional notify shim)."""
     rows = query_db(
         "SELECT r.id, r.task_id, r.user_id, r.message, t.title FROM task_reminders r JOIN tasks t ON r.task_id=t.id WHERE r.sent=0 AND r.remind_at <= ? LIMIT 100",
         (utc_now(),)
@@ -9951,58 +10167,20 @@ def _process_task_reminders():
         try:
             payload = {"reminder_id": r["id"], "task_id": r["task_id"], "task_title": r["title"], "message": r.get("message") or f"Напоминание: {r['title']}"}
             sse_push(int(r["user_id"]), "task.reminder", payload)
-            notify_user_channels(int(r["user_id"]), f"Напоминание по задаче #{r['task_id']}: {r['title']}")  # type: ignore
+            try:
+                # optional shim from CORE 6/10
+                if "notify" in globals() and callable(globals().get("notify")):
+                    notify(int(r["user_id"]), f"Напоминание по задаче #{r['task_id']}", r.get("message") or r["title"], kind="info")  # type: ignore
+            except Exception:
+                pass
             exec_db("UPDATE task_reminders SET sent=1 WHERE id=?", (r["id"],))
         except Exception as e:
             log("WARN", "reminder failed", error=str(e))
 
-def _mv_refresh_dashboard():
-    """Refresh materialized rollups for dashboard to speed up first screen (final version)."""
-    try:
-        # Ensure auxiliary table exists
-        _ensure_mv_tables()
-        orgs = query_db("SELECT id FROM orgs", ()) or []
-        for o in orgs:
-            oid = int(o["id"])
-            open_tasks = query_db(
-                "SELECT COUNT(*) AS c FROM tasks WHERE org_id=? AND status NOT IN ('done','cancelled')",
-                (oid,), one=True
-            )
-            open_deals = query_db(
-                "SELECT COUNT(*) AS c FROM deals WHERE org_id=? AND status='open'",
-                (oid,), one=True
-            )
-            kv = [("open_tasks", int((open_tasks or {}).get("c") or 0)),
-                  ("open_deals", int((open_deals or {}).get("c") or 0))]
-            for k, v in kv:
-                if DIALECT == "postgres":
-                    exec_db(
-                        "INSERT INTO mv_dashboard (org_id, key, value_number, updated_at) VALUES (?, ?, ?, NOW()) "
-                        "ON CONFLICT (org_id, key) DO UPDATE SET value_number=EXCLUDED.value_number, updated_at=EXCLUDED.updated_at",
-                        (oid, k, float(v))
-                    )
-                else:
-                    exec_db(
-                        "INSERT OR REPLACE INTO mv_dashboard (org_id, key, value_number, updated_at) VALUES (?, ?, ?, ?)",
-                        (oid, k, float(v), utc_now())
-                    )
-    except Exception as e:
-        log("WARN", "mv_refresh_dashboard failed", error=str(e))
-
-def _ratelimit_housekeeping():
-    now = time.time()
-    with _rate_lock:
-        stale_before = now - 180
-        for k2, lst in list(_rate_buckets.items()):
-            nlst = [t for t in lst if t >= stale_before]
-            if nlst:
-                _rate_buckets[k2] = nlst[-100:]
-            else:
-                _rate_buckets.pop(k2, None)
-
 def webhook_worker():
     log("INFO", "webhook_worker started")
     with app.app_context():
+        _workers_last_tick["webhook"] = time.time()
         while not _shutdown_event.is_set():
             try:
                 _webhook_deliver_once()
@@ -10016,6 +10194,7 @@ def maintenance_worker():
     log("INFO", "maintenance_worker started")
     with app.app_context():
         tick = 0
+        _workers_last_tick["maintenance"] = time.time()
         while not _shutdown_event.is_set():
             try:
                 # cleanup old rows
@@ -10023,23 +10202,30 @@ def maintenance_worker():
                 cutoff365 = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
                 exec_db("DELETE FROM webhook_queue WHERE status IN ('delivered','failed') AND created_at < ?", (cutoff30,))
                 exec_db("DELETE FROM audit_logs WHERE created_at < ?", (cutoff365,))
+
                 _process_task_reminders()
                 _wf_execute_once()
                 _ai_job_process_pending()
                 _email_sequence_worker()
+
                 if tick % 10 == 0:
                     _mv_refresh_dashboard()
-                if tick % 60 == 0:
-                    orgs = query_db("SELECT id FROM orgs", ()) or []
-                    for o in orgs:
+
+                # Renew leader TTL to avoid split-brain (every ~2 minutes)
+                if tick % 2 == 0:
+                    r = get_redis()
+                    if r:
                         try:
-                            twin_proactive_scan(int(o["id"]))  # type: ignore
+                            _redis_cb.call(r.expire, "workers:leader", 120)
                         except Exception:
                             pass
+
                 if DIALECT == "sqlite":
                     wal_checkpoint_if_needed()
+
                 if tick % 5 == 0:
                     _ratelimit_housekeeping()
+
                 # L1 cache cleanup
                 _global_cache.cleanup()
             except Exception as e:
@@ -10052,6 +10238,7 @@ def maintenance_worker():
 def calendar_reminders_worker():
     log("INFO", "calendar_reminders_worker started")
     with app.app_context():
+        _workers_last_tick["calendar_reminders"] = time.time()
         while not _shutdown_event.is_set():
             try:
                 # Send reminders due in next 5 minutes (buffer)
@@ -10105,8 +10292,7 @@ def start_workers_once():
         _workers_started = True
         log("INFO", "Background workers started")
 
-
-# ===== BLOCK: SYSTEM ENDPOINTS =====
+# ===== BLOCK: SYSTEM ENDPOINTS (METRICS/HEALTH/READY) =====
 def db_health_check() -> bool:
     """Simple DB health probe with 3 retries."""
     for attempt in range(3):
@@ -10123,30 +10309,59 @@ def check_workers_alive() -> Dict[str, bool]:
 
 @app.route("/metrics")
 def metrics():
+    def _esc_label(v: str) -> str:
+        s = str(v)
+        s = s.replace("\\", "\\\\").replace("\"", "\\\"")
+        return s
+
     out = []
     with _metrics_lock:
+        # requests total
         out.append("# HELP crm_requests_total Total HTTP requests")
         out.append("# TYPE crm_requests_total counter")
         out.append(f"crm_requests_total {_metrics.get('requests_total', 0)}")
+
+        # errors total
         out.append("# HELP crm_errors_total Total errors")
         out.append("# TYPE crm_errors_total counter")
         out.append(f"crm_errors_total {_metrics.get('errors_total', 0)}")
+
         # by endpoint
+        out.append("# HELP crm_requests_by_endpoint Requests by endpoint")
+        out.append("# TYPE crm_requests_by_endpoint counter")
         for key, count in (_metrics.get("requests_by_endpoint") or {}).items():
             labels = dict(key) if isinstance(key, frozenset) else {}
-            endpoint = labels.get("endpoint", "unknown")
+            endpoint = _esc_label(labels.get("endpoint", "unknown"))
             out.append(f'crm_requests_by_endpoint{{endpoint="{endpoint}"}} {count}')
+
         # by status
+        out.append("# HELP crm_requests_by_status Requests by HTTP status")
+        out.append("# TYPE crm_requests_by_status counter")
         for key, count in (_metrics.get("requests_by_status") or {}).items():
             labels = dict(key) if isinstance(key, frozenset) else {}
-            status = labels.get("status", "0")
+            status = _esc_label(labels.get("status", "0"))
             out.append(f'crm_requests_by_status{{status="{status}"}} {count}')
+
         # rate limit exceeded
+        out.append("# HELP crm_rate_limit_exceeded_total Rate limit exceeded events")
+        out.append("# TYPE crm_rate_limit_exceeded_total counter")
         out.append(f"crm_rate_limit_exceeded_total {_metrics.get('rate_limit_exceeded', 0)}")
+
         # SSE drops
         out.append("# HELP crm_sse_dropped_total Dropped SSE messages")
         out.append("# TYPE crm_sse_dropped_total counter")
         out.append(f"crm_sse_dropped_total {_metrics.get('sse_dropped_total', 0)}")
+
+        # SSE connections gauge (by user)
+        out.append("# HELP crm_sse_connections Number of active SSE connections per user")
+        out.append("# TYPE crm_sse_connections gauge")
+        try:
+            with _sse_lock:
+                for uid, qs in _sse_queues.items():
+                    out.append(f'crm_sse_connections{{user="{int(uid)}"}} {len(qs)}')
+        except Exception:
+            pass
+
     return Response("\n".join(out), mimetype="text/plain")
 
 @app.route("/health")
@@ -10185,58 +10400,9 @@ def readyz():
         return jsonify(ok=ready, ready=ready, workers=live)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 503
-
-
-# ===== BLOCK: REPORTS ENDPOINTS =====
-@app.route("/api/reports/tasks_daily", methods=["GET"])
-@_login_required
-def api_reports_tasks_daily():
-    user = g.user
-    df = request.args.get("date_from"); dt = request.args.get("date_to")
-    where = ["org_id=?"]; params: List[Any] = [user["org_id"]]
-    if df:
-        where.append("date(created_at) >= date(?)"); params.append(ensure_iso_datetime(df))
-    if dt:
-        where.append("date(created_at) <= date(?)"); params.append(ensure_iso_datetime(dt))
-    wc = " AND ".join(where)
-    rows = query_db(f"""
-    SELECT date(created_at) AS ymd,
-           COUNT(*) AS created_cnt,
-           SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_cnt,
-           SUM(CASE WHEN status NOT IN ('done','cancelled') AND due_at IS NOT NULL AND due_at < ? THEN 1 ELSE 0 END) AS overdue_cnt
-    FROM tasks WHERE {wc}
-    GROUP BY date(created_at)
-    ORDER BY ymd DESC
-    LIMIT 180
-    """, (*params, utc_now()))
-    return jsonify(ok=True, items=rows or [])
-
-@app.route("/api/reports/calls_daily", methods=["GET"])
-@_login_required
-def api_reports_calls_daily():
-    user = g.user
-    df = request.args.get("date_from"); dt = request.args.get("date_to")
-    where = ["org_id=?"]; params: List[Any] = [user["org_id"]]
-    if df:
-        where.append("date(started_at) >= date(?)"); params.append(ensure_iso_datetime(df))
-    if dt:
-        where.append("date(started_at) <= date(?)"); params.append(ensure_iso_datetime(dt))
-    wc = " AND ".join(where)
-    rows = query_db(f"""
-    SELECT date(started_at) AS ymd,
-           SUM(CASE WHEN direction='inbound' THEN 1 ELSE 0 END) AS in_cnt,
-           SUM(CASE WHEN direction='outbound' THEN 1 ELSE 0 END) AS out_cnt
-    FROM calls WHERE {wc}
-    GROUP BY date(started_at)
-    ORDER BY ymd DESC
-    LIMIT 180
-    """, tuple(params))
-    return jsonify(ok=True, items=rows or [])
-
-# ===== END OF CORE PART 10/10 (3/3) =====
+# ==================== END OF CORE PART 10/10 (3/3) ====================
 # ===== START OF STYLES PART 1/10 =====
 # coding: utf-8
-
 # ==================== STYLES PART 1/10 ====================
 # ===== BLOCK: TEMPLATES =====
 
@@ -10298,6 +10464,11 @@ BASE_JS = r"""
 
   // CSRF
   window.CSRF = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+
+  // Idempotency-Key (client generator for sensitive POST operations)
+  window.IDK = function(){
+    try{ return crypto.randomUUID(); }catch(e){ return String(Date.now())+'-'+Math.random().toString(16).slice(2); }
+  };
 
   // Notifications store
   const NOTIF = {
@@ -10554,8 +10725,9 @@ PROFILE_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", """
 @_login_required
 def index():
     user = g.user
-    open_tasks = query_db("SELECT COUNT() AS c FROM tasks WHERE org_id=? AND status NOT IN ('done','cancelled')", (user["org_id"],), one=True)["c"] or 0
-    my_tasks = query_db("SELECT COUNT() AS c FROM tasks WHERE org_id=? AND assignee_id=? AND status NOT IN ('done','cancelled')", (user["org_id"], user["id"]), one=True)["c"] or 0
+    # FIX: COUNT(*) for Postgres compatibility
+    open_tasks = query_db("SELECT COUNT(*) AS c FROM tasks WHERE org_id=? AND status NOT IN ('done','cancelled')", (user["org_id"],), one=True)["c"] or 0
+    my_tasks = query_db("SELECT COUNT(*) AS c FROM tasks WHERE org_id=? AND assignee_id=? AND status NOT IN ('done','cancelled')", (user["org_id"], user["id"]), one=True)["c"] or 0
     open_deals = query_db("SELECT COUNT(*) AS c FROM deals WHERE org_id=? AND status='open'", (user["org_id"],), one=True)["c"] or 0
     try:
         nba = BusinessTwin(user["org_id"]).next_best_actions(limit=3)  # type: ignore
@@ -10748,6 +10920,8 @@ TASKS_LIST_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   Q('btnNewTask')?.addEventListener('click', ()=> Q('modalNew')?.classList.add('show'));
 
   function toServerDT(val){ if(!val) return null; return val.replace('T',' ')+":00"; }
+
+  // Используем Idempotency-Key для защиты от дублей создания
   window.createTask = async ()=>{
     const title = Q('new_title').value.trim(); if(!title){ toast('Укажите заголовок'); return; }
     const body = {
@@ -10760,9 +10934,17 @@ TASKS_LIST_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
       assignee_id: Q('new_assign_me').checked ? (Number((document.body||{}).getAttribute('data-userid'))||null) : null
     };
     try{
-      const r=await fetch('/api/task/create',{ method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':'{{ session.get("csrf_token","") }}'}, body: JSON.stringify(body) });
+      const r=await fetch('/api/task/create',{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':'{{ session.get("csrf_token","") }}',
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body: JSON.stringify(body)
+      });
       const j=await r.json();
-      if(j.ok){ toast('Задача создана'); closeNewModal();
+      if(j.ok){ toast(j.duplicated? 'Дубликат: операция уже выполнена' : 'Задача создана'); closeNewModal();
         Q('new_title').value=''; Q('new_desc').value=''; Q('new_due').value=''; Q('new_company').value=''; Q('new_contact').value='';
         fetchTasks();
       } else { toast(j.error||'Не удалось создать'); }
@@ -11227,7 +11409,15 @@ DEALS_KANBAN_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r""
         const id = Number(e.dataTransfer.getData('text/plain')||0); if(!id) return;
         const newStage = zone.getAttribute('data-stage');
         try{
-          const r = await fetch(`/ui/deal/${id}/stage`, {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({stage:newStage})});
+          const r = await fetch(`/ui/deal/${id}/stage`, {
+            method:'POST',
+            headers:{
+              'Content-Type':'application/json',
+              'X-CSRFToken': CSRF,
+              'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+            },
+            body: JSON.stringify({stage:newStage})
+          });
           const j = await r.json();
           if(j.ok){ toast('Стадия изменена'); loadData(); } else { toast(j.error||'Ошибка'); }
         }catch(_){ toast('Сеть недоступна'); }
@@ -11248,6 +11438,7 @@ DEALS_KANBAN_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r""
   window.closeDealModal = ()=> Q('#modalNewDeal')?.classList.remove('show');
   Q('#btnNewDeal')?.addEventListener('click', ()=> Q('#modalNewDeal')?.classList.add('show'));
 
+  // Создание сделки — с Idempotency-Key
   window.createDeal = async ()=>{
     const title = Q('#nd_title').value.trim(); if(!title){ toast('Укажите название'); return; }
     const payload = {
@@ -11260,7 +11451,15 @@ DEALS_KANBAN_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r""
       stage: Q('#nd_stage').value || 'new'
     };
     try{
-      const r=await fetch('/ui/deal/create', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify(payload)});
+      const r=await fetch('/ui/deal/create', {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken': CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body: JSON.stringify(payload)
+      });
       const j=await r.json();
       if(j.ok){ toast('Сделка создана'); closeDealModal(); loadData(); } else { toast(j.error||'Не удалось создать'); }
     }catch(_){ toast('Сеть недоступна'); }
@@ -11384,7 +11583,14 @@ DEAL_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
       stage: document.getElementById('d_stage').value || 'new'
     };
     try{
-      const r = await fetch(`/ui/deal/${DID}/update`, {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify(payload)});
+      const r = await fetch(`/ui/deal/${DID}/update`, {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken': CSRF
+        },
+        body: JSON.stringify(payload)
+      });
       const j = await r.json();
       toast(j.ok? 'Сохранено' : (j.error||'Ошибка'));
     }catch(_){ toast('Сеть недоступна'); }
@@ -11393,7 +11599,15 @@ DEAL_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   async function changeStage(){
     const stage = document.getElementById('d_stage').value || 'new';
     try{
-      const r = await fetch(`/ui/deal/${DID}/stage`, {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF}, body: JSON.stringify({stage})});
+      const r = await fetch(`/ui/deal/${DID}/stage`, {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken': CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body: JSON.stringify({stage})
+      });
       const j = await r.json();
       if(j.ok){ toast('Стадия изменена'); } else { toast(j.error||'Ошибка'); }
     }catch(_){ toast('Сеть недоступна'); }
@@ -11841,7 +12055,7 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   }
 
   function renderPendingFiles(){
-    document.getElementById('files').textContent = pendingFiles.map(x=>x.name||('file#'+x.id)).join(', ');
+    document.getElementById('files').textContent = pendingFiles.map(f=> (f.name||('file#'+f.id))).join(', ');
   }
 
   async function sendMsg(){
@@ -11849,13 +12063,20 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
     const internal = document.getElementById('internal').checked;
     if(!body && pendingFiles.length===0){ toast('Пустое сообщение'); return; }
     try{
-      const r = await fetch('/api/message/send', {method:'POST', headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
-        body: JSON.stringify({thread_id: TID, body, internal_note: internal, attachments: pendingFiles.map(x=>({file_id:x.id}))})});
+      const r = await fetch('/api/message/send', {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body: JSON.stringify({thread_id: TID, body, internal_note: internal, attachments: pendingFiles.map(x=>({file_id:x.id}))})
+      });
       const j = await r.json();
       if(j.ok){
-        toast('Отправлено');
+        toast(j.duplicated? 'Дубликат: сообщение уже отправлено' : 'Отправлено');
         document.getElementById('body').value=''; pendingFiles=[]; renderPendingFiles();
-        // preprend our message (optimistic)
+        // optimistic prepend
         renderMsgs([{id:j.id, sender_type:'agent', user_name:'Вы', external_user_id:'', body, internal_note:internal, created_at:new Date().toLocaleString(), attachments:[]}], true);
       }else toast(j.error||'Ошибка');
     }catch(_){ toast('Ошибка сети'); }
@@ -11885,8 +12106,15 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
     const title = prompt('Заголовок задачи', 'Обработать обращение');
     if(!title) return;
     try{
-      const r=await fetch('/api/message/to_task',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},
-        body: JSON.stringify({message_id: mid, title})});
+      const r=await fetch('/api/message/to_task',{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body: JSON.stringify({message_id: mid, title})
+      });
       const j=await r.json();
       toast(j.ok? ('Задача #'+j.task_id) : (j.error||'Ошибка'));
     }catch(_){ toast('Ошибка сети'); }
@@ -11896,7 +12124,15 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   function showAI(text){ const box=document.getElementById('aiBox'); const tt=document.getElementById('aiText'); tt.textContent = text||''; box.style.display = 'block'; }
   async function aiSummarize(){
     try{
-      const r=await fetch('/api/ai/summarize_thread',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({thread_id:TID})});
+      const r=await fetch('/api/ai/summarize_thread',{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body:JSON.stringify({thread_id:TID})
+      });
       const j=await r.json();
       if(j.ok && j.job_id){ pollJob(j.job_id, (res)=> showAI(res.output_text||'Готово')); toast('Запрос отправлен'); }
       else toast(j.error||'Ошибка');
@@ -11904,7 +12140,15 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   }
   async function aiDraft(){
     try{
-      const r=await fetch('/api/ai/draft_reply',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({thread_id:TID})});
+      const r=await fetch('/api/ai/draft_reply',{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body:JSON.stringify({thread_id:TID})
+      });
       const j=await r.json();
       if(j.ok && j.variants){ showAI(j.variants[0]||''); }
       else if(j.ok && j.job_id){ pollJob(j.job_id, (res)=> showAI(res.output_text||'')); toast('Запрос отправлен'); }
@@ -11913,7 +12157,15 @@ THREAD_VIEW_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
   }
   async function aiAutotag(){
     try{
-      const r=await fetch('/api/ai/autotag',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':CSRF},body:JSON.stringify({thread_id:TID})});
+      const r=await fetch('/api/ai/autotag',{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-CSRFToken':CSRF,
+          'Idempotency-Key': (window.IDK && window.IDK()) || (Date.now()+'-'+Math.random())
+        },
+        body:JSON.stringify({thread_id:TID})
+      });
       const j=await r.json();
       if(j.ok && j.job_id){ pollJob(j.job_id, ()=>{ toast('Теги будут обновлены'); setTimeout(saveThread, 1000); }); }
       else toast(j.error||'Ошибка');
@@ -12010,10 +12262,17 @@ def ui_thread_messages(thread_id: int):
     atts_map = {}
     if mids:
         ph = ",".join(["?"]*len(mids))
+        # ORG-SAFE: attachments ограничены организацией треда (join на m->t и фильтр t.org_id=?)
         att = query_db(
-            f"SELECT a.message_id, f.id AS file_id, f.name, f.content_type, f.size_bytes "
-            f"FROM message_attachments a JOIN files f ON f.id=a.file_id WHERE a.message_id IN ({ph})",
-            tuple(mids)
+            f"""
+            SELECT a.message_id, f.id AS file_id, f.name, f.content_type, f.size_bytes
+            FROM message_attachments a
+            JOIN files f ON f.id=a.file_id
+            JOIN inbox_messages m ON m.id=a.message_id
+            JOIN inbox_threads t ON t.id=m.thread_id
+            WHERE a.message_id IN ({ph}) AND t.org_id=?
+            """,
+            tuple(mids + [user["org_id"]])
         ) or []
         for a in att:
             atts_map.setdefault(int(a["message_id"]), []).append({
@@ -14647,45 +14906,6 @@ SETTINGS_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
 {% endblock %}
 """)
 
-# ===== BLOCK: PAGE ROUTES — AGENTS & SETTINGS =====
-@app.route("/agents")
-@_login_required
-def agents_page():
-    return render_template_string(
-        AGENTS_TMPL,
-        user=g.user,
-        css=DESIGN_SYSTEM_CSS,
-        js=BASE_JS,
-        csp_nonce=g.get("csp_nonce","")
-    )
-
-@app.route("/settings")
-@_login_required
-def settings_page():
-    return render_template_string(
-        SETTINGS_TMPL,
-        user=g.user,
-        css=DESIGN_SYSTEM_CSS,
-        js=BASE_JS,
-        csp_nonce=g.get("csp_nonce","")
-    )
-
-# ===== BLOCK: UI ENDPOINTS — MISC (NOTIFY TEST) =====
-@app.route("/ui/notify/test", methods=["POST"])
-@_login_required
-@_csrf_protect
-def ui_notify_test():
-    user = g.user
-    data = request.get_json() or {}
-    title = (data.get("title") or "Тест уведомления").strip()
-    body = (data.get("body") or "Это тестовое уведомление").strip()
-    kind = (data.get("kind") or "info").strip()
-    try:
-        notify(int(user["id"]), title, body, kind=kind)  # type: ignore
-        return jsonify(ok=True)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
 # ===== BLOCK: ANALYTICS PAGE =====
 ANALYTICS_TMPL = LAYOUT_TMPL.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
@@ -14984,11 +15204,15 @@ def ui_chat_history():
     ch_id = int(request.args.get("channel_id") or 0)
     if not ch_id:
         return jsonify(ok=False, error="channel_id required"), 400
+    # ORG-SAFE: ограничиваем историю каналом в рамках организации
     rows = query_db(
         "SELECT m.id, m.user_id, u.username AS user_name, m.body, m.created_at "
-        "FROM chat_messages m LEFT JOIN users u ON u.id=m.user_id "
-        "WHERE m.channel_id=? ORDER BY m.id ASC LIMIT 500",
-        (ch_id,)
+        "FROM chat_messages m "
+        "JOIN chat_channels ch ON ch.id=m.channel_id "
+        "LEFT JOIN users u ON u.id=m.user_id "
+        "WHERE m.channel_id=? AND ch.org_id=? "
+        "ORDER BY m.id ASC LIMIT 500",
+        (ch_id, g.user["org_id"])
     ) or []
     return jsonify(ok=True, items=rows)
 
